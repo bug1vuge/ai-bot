@@ -260,3 +260,58 @@ async def test_throttle_drops_flood(tmp_path, sample_pdf):
     finally:
         router._parent_router = None
         await db.close()
+
+
+async def test_return_before_notification_waits_and_delivers(env, monkeypatch):
+    """Покупатель вернулся со страницы оплаты раньше уведомления Робокассы:
+    бот подождёт, а не скажет «оплата не поступила»."""
+    import asyncio
+
+    import bot.handlers as handlers
+    from tests.test_shop import result_params
+    monkeypatch.setattr(handlers, "RETURN_CHECK_PAUSE", 0.05)
+    dp, bot, shop, session = env
+    await shop.db.upsert_user(111, "ivan", "Иван", None)
+    pid, _ = await shop.get_or_create_payment(111)
+
+    async def notify_later():
+        await asyncio.sleep(0.12)
+        await shop.handle_result(result_params(pid))
+    task = asyncio.create_task(notify_later())
+    await dp.feed_update(bot, msg_update(300, "/start paid"))
+    await task
+    await shop.wait_background()
+    msgs = texts_of(session)
+    assert docs_of(session) == 1
+    assert not any("пока не поступила" in t for t in msgs)
+    assert any("Проверяю оплату" in t for t in msgs) and any("Оплата прошла" in t for t in msgs)
+
+
+async def test_return_without_payment_says_pending(env, monkeypatch):
+    import bot.handlers as handlers
+    monkeypatch.setattr(handlers, "RETURN_CHECK_PAUSE", 0.01)
+    dp, bot, shop, session = env
+    await shop.db.upsert_user(111, "ivan", "Иван", None)
+    await shop.get_or_create_payment(111)
+    await dp.feed_update(bot, msg_update(310, "/start paid"))
+    assert "пока не поступила" in texts_of(session)[-1] and docs_of(session) == 0
+
+
+async def test_start_delivers_undelivered_guide(env, monkeypatch):
+    dp, bot, shop, session = env
+    from tests.test_shop import result_params
+    await shop.db.upsert_user(111, "ivan", "Иван", None)
+    pid, _ = await shop.get_or_create_payment(111)
+    real = session.make_request
+
+    async def blocked(bot_, method, timeout=None):
+        if isinstance(method, (SendMessage, SendDocument)) and method.chat_id == 111:
+            raise RuntimeError("Forbidden: bot was blocked by the user")
+        return await real(bot_, method, timeout)
+    session.make_request = blocked
+    await shop.handle_result(result_params(pid))
+    await shop.wait_background()
+    assert docs_of(session) == 0
+    session.make_request = real                   # пользователь разблокировал бота
+    await dp.feed_update(bot, msg_update(320, "/start"))
+    assert docs_of(session) == 1

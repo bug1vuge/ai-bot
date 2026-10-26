@@ -1,4 +1,5 @@
 """Обработчики сообщений и кнопок."""
+import asyncio
 import contextlib
 import html
 import logging
@@ -20,6 +21,8 @@ router.callback_query.filter(F.message.chat.type == "private")
 # Повторная отправка файла не чаще, чем раз в столько секунд на пользователя
 RESEND_COOLDOWN_SEC = 20
 _last_sent: dict[int, float] = {}
+# После возврата со страницы оплаты ждём подтверждения столько раз с такой паузой (≈ 20 с)
+RETURN_CHECKS, RETURN_CHECK_PAUSE = 8, 2.5
 
 
 def _price(shop: Shop) -> str:
@@ -75,6 +78,9 @@ async def start(message: Message, command: CommandObject, shop: Shop, bot: Bot):
     payload = (command.args or "").strip()[:64] or None
     source = payload if payload and payload not in {"paid", "fail"} else None
     await shop.db.upsert_user(user.id, user.username, user.first_name, source)
+    # оплаченный, но не доставленный гайд (бот был заблокирован, Telegram недоступен) — отдаём сразу
+    if await shop.deliver_pending_for_user(user.id):
+        return
     paid = await shop.db.has_paid(user.id)
 
     # Пользователь вернулся со страницы оплаты (Success URL / Fail URL Робокассы)
@@ -85,7 +91,7 @@ async def start(message: Message, command: CommandObject, shop: Shop, bot: Bot):
             return
         pending = await shop.db.latest_pending(user.id)
         if pending:
-            await _check_and_reply(bot, shop, user.id, pending["payment_id"])
+            await _wait_for_payment(bot, shop, user.id, pending["payment_id"])
             return
     if payload == "fail" and not paid:
         await message.answer(texts.PAY_FAILED, reply_markup=main_kb(shop, False))
@@ -141,16 +147,41 @@ async def check(call: CallbackQuery, shop: Shop, bot: Bot):
     await _check_and_reply(bot, shop, call.from_user.id, payment_id)
 
 
+async def _wait_for_payment(bot: Bot, shop: Shop, user_id: int, payment_id: str):
+    """Покупатель вернулся со страницы оплаты раньше, чем дошло уведомление Робокассы.
+    Несколько секунд ждём подтверждения, чтобы не пугать его «оплата не поступила»."""
+    await _send(bot, user_id, texts.CHECKING_PAYMENT)
+    status = "pending"
+    for attempt in range(RETURN_CHECKS):
+        try:
+            status = await shop.process_payment(payment_id)
+        except Exception:
+            log.exception("Ошибка проверки платежа %s", payment_id)
+            status = "error"
+        if status in {"succeeded", "already_delivered", "in_progress"}:
+            return  # гайд отправлен — сообщение «Оплата прошла» уже в чате
+        if status in {"delivery_failed", "canceled"}:
+            break
+        if attempt < RETURN_CHECKS - 1:
+            await asyncio.sleep(RETURN_CHECK_PAUSE)
+    await _reply_status(bot, shop, user_id, status)
+
+
 async def _check_and_reply(bot: Bot, shop: Shop, user_id: int, payment_id: str):
     try:
         status = await shop.process_payment(payment_id)
     except Exception:
         log.exception("Ошибка проверки платежа %s", payment_id)
-        await _send(bot, user_id, texts.CHECK_ERROR)
-        return
+        status = "error"
+    await _reply_status(bot, shop, user_id, status)
+
+
+async def _reply_status(bot: Bot, shop: Shop, user_id: int, status: str):
     if status in {"succeeded", "in_progress"}:
         return  # благодарность и файл уже отправлены или отправляются прямо сейчас
-    if status == "already_delivered":
+    if status == "error":
+        await _send(bot, user_id, texts.CHECK_ERROR)
+    elif status == "already_delivered":
         await _send(bot, user_id, texts.PAID_ALREADY_SENT, reply_markup=main_kb(shop, True))
     elif status == "delivery_failed":
         await _send(bot, user_id, texts.CHECK_DELIVERY_RETRY)
@@ -202,6 +233,8 @@ async def my_cmd(message: Message, shop: Shop, bot: Bot):
 
 
 async def _send_my(bot: Bot, shop: Shop, user_id: int):
+    if await shop.deliver_pending_for_user(user_id):
+        return
     if await shop.db.has_paid(user_id):
         await _send_product(bot, shop, user_id)
     else:
