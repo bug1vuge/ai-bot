@@ -76,7 +76,7 @@ if [[ -z "$DOMAIN" ]]; then
   DOMAIN="${IP//./-}.sslip.io"
 fi
 PUBLIC_URL="https://$DOMAIN"
-say "Адрес бота для Робокассы: $PUBLIC_URL"
+say "Адрес бота: $PUBLIC_URL"
 
 # ---------------------------------------------------------------- файлы
 say "Копирую файлы в $APP_DIR"
@@ -89,6 +89,8 @@ if [[ "$SRC_DIR" != "$APP_DIR" ]]; then
   if [[ -f "$SRC_DIR/.env" && ! -f "$APP_DIR/.env" ]]; then cp "$SRC_DIR/.env" "$APP_DIR/.env"; fi
 fi
 [[ -f "$APP_DIR/.env" ]] || cp "$APP_DIR/.env.example" "$APP_DIR/.env"
+# настройки Робокассы больше не используются (оплата через Prodamus)
+sed -i '/^ROBOKASSA_/d' "$APP_DIR/.env"
 
 ENVTOOL="python3 $APP_DIR/deploy/set_env.py $APP_DIR/.env"
 
@@ -119,12 +121,11 @@ if [[ -t 0 ]]; then
   ask BOT_TOKEN "Токен бота от @BotFather" secret
   ask ADMIN_IDS "Ваш Telegram ID (из @userinfobot)"
   ask SUPPORT_USERNAME "Ник для поддержки без @"
-  ask SELLER_NAME "Ваши ФИО полностью (для оферты)"
+  ask SELLER_NAME "ФИО точно как в паспорте и в «Мой налог» (для оферты и описания бота)"
   ask SELLER_INN "Ваш ИНН"
   ask SELLER_EMAIL "E-mail для связи с покупателями"
-  ask ROBOKASSA_LOGIN "Идентификатор магазина в Робокассе"
-  ask ROBOKASSA_PASSWORD1 "Робокасса: пароль #1 (тестовый, пока магазин не активирован)" secret
-  ask ROBOKASSA_PASSWORD2 "Робокасса: пароль #2 (тестовый, пока магазин не активирован)" secret
+  ask PRODAMUS_URL "Адрес платёжной страницы Prodamus (например https://aibezlesa.payform.ru)"
+  ask PRODAMUS_SECRET "Секретный ключ платёжной страницы Prodamus" secret
 fi
 [[ -n "$($ENVTOOL BOT_TOKEN)" ]] || die "В $APP_DIR/.env не указан BOT_TOKEN. Впишите его: nano $APP_DIR/.env — и запустите скрипт снова."
 
@@ -188,16 +189,16 @@ systemctl daemon-reload
 systemctl enable "$SERVICE" >/dev/null
 systemctl restart "$SERVICE"
 
-# ---------------------------------------------------------------- HTTPS для адресов Робокассы
+# ---------------------------------------------------------------- HTTPS для адресов бота
 if [[ "$WEB_MODE" == caddy ]]; then
-  say "Настраиваю HTTPS для адресов Робокассы (Caddy)"
+  say "Настраиваю HTTPS для адресов бота (Caddy)"
   if [[ -f /etc/caddy/Caddyfile ]] && ! grep -q "guide-bot" /etc/caddy/Caddyfile; then
     cp /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.backup.$(date +%s)"
   fi
   cat > /etc/caddy/Caddyfile <<CADDY
-# guide-bot: адреса для Робокассы
+# guide-bot: уведомления об оплате и оферта
 $DOMAIN {
-	handle /robokassa/* {
+	handle /pay/* {
 		reverse_proxy 127.0.0.1:$BOT_PORT
 	}
 	handle /health {
@@ -214,7 +215,7 @@ CADDY
   systemctl enable caddy >/dev/null
   systemctl restart caddy
 else
-  say "Настраиваю HTTPS для адресов Робокассы (nginx + certbot)"
+  say "Настраиваю HTTPS для адресов бота (nginx + certbot)"
   NGX=/etc/nginx/conf.d/guide-bot.conf
   if [[ -f "$NGX" ]] && ! grep -q "server_name $DOMAIN;" "$NGX"; then
     # адрес бота сменился (например, с sslip.io на свой домен) — настраиваем заново
@@ -231,14 +232,18 @@ else
     if ! grep -q "location = /offer" "$NGX"; then
       sed -i "s#^    location = /health {#    location = /offer {\n        proxy_pass http://127.0.0.1:$BOT_PORT;\n    }\n    location = /health {#" "$NGX"
     fi
+    if ! grep -q "location /pay/" "$NGX"; then
+      # адреса Prodamus (раньше были только адреса Робокассы)
+      sed -i "s#^    location = /health {#    location /pay/ {\n        proxy_pass http://127.0.0.1:$BOT_PORT;\n        proxy_set_header Host \$host;\n        proxy_set_header X-Forwarded-For \$remote_addr;\n        proxy_set_header X-Forwarded-Proto \$scheme;\n    }\n    location = /health {#" "$NGX"
+    fi
   else
     cat > "$NGX" <<NGINX
-# guide-bot: адреса для Робокассы (отдельный сайт, другие сайты не затрагивает)
+# guide-bot: уведомления об оплате и оферта (отдельный сайт, другие сайты не затрагивает)
 server {
     listen 80;
     server_name $DOMAIN;
 
-    location /robokassa/ {
+    location /pay/ {
         proxy_pass http://127.0.0.1:$BOT_PORT;
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-For \$remote_addr;
@@ -293,12 +298,10 @@ done
 cat <<DONE
 
 ==================================================================
- Готово! Впишите в Робокассе (Технические настройки магазина):
+ Готово! В личном кабинете Prodamus, в настройках платёжной страницы:
 
-   Result URL:   $PUBLIC_URL/robokassa/result    метод POST
-   Success URL:  $PUBLIC_URL/robokassa/success   метод GET
-   Fail URL:     $PUBLIC_URL/robokassa/fail      метод GET
-   Алгоритм расчёта хеша: MD5
+   URL для уведомлений:  $PUBLIC_URL/pay/notify
+   Секретный ключ — тот же, что в PRODAMUS_SECRET в $APP_DIR/.env
 
  Оферта (проверьте ФИО, ИНН и контакты):  $PUBLIC_URL/offer
 
