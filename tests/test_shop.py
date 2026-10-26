@@ -245,6 +245,9 @@ async def test_offer_page(shop):
     async with TestClient(TestServer(make_app(shop))) as client:
         r = await client.get("/offer")
         assert r.status == 200 and "text/html" in r.headers["Content-Type"] and "Публичная оферта" in await r.text()
+        assert r.headers["X-Content-Type-Options"] == "nosniff" and "default-src 'none'" in r.headers["Content-Security-Policy"]
+        big = await client.post("/robokassa/result", data={"x": "a" * 100_000})
+        assert big.status == 413
 
 
 def test_config_defaults_offer_and_seller(monkeypatch):

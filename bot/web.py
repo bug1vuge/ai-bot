@@ -20,9 +20,31 @@ async def _params(request: web.Request) -> dict:
     if request.method == "POST":
         try:
             data.update(dict(await request.post()))
+        except web.HTTPException:
+            raise  # например, слишком большое тело запроса — 413
         except Exception:
-            pass
+            log.warning("Не удалось разобрать тело запроса от %s", request.remote)
     return {k: str(v) for k, v in data.items()}
+
+
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    # страница оферты — статичный HTML со встроенными стилями, скрипты и внешние ресурсы не нужны
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+}
+
+
+@web.middleware
+async def security_headers(request: web.Request, handler):
+    try:
+        resp = await handler(request)
+    except web.HTTPException as e:
+        e.headers.update(SECURITY_HEADERS)
+        raise
+    resp.headers.update(SECURITY_HEADERS)
+    return resp
 
 
 def make_app(shop: Shop) -> web.Application:
@@ -57,7 +79,8 @@ def make_app(shop: Shop) -> web.Application:
     async def health(_: web.Request) -> web.Response:
         return web.Response(text="ok")
 
-    app = web.Application()
+    # уведомления Робокассы — несколько сотен байт; большие тела отклоняем сразу
+    app = web.Application(middlewares=[security_headers], client_max_size=64 * 1024)
     app.router.add_route("*", "/robokassa/result", result)
     app.router.add_route("*", "/robokassa/success", success)
     app.router.add_route("*", "/robokassa/fail", fail)
