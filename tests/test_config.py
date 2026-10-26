@@ -30,12 +30,31 @@ def test_validate_rejects_plain_http(monkeypatch, sample_pdf):
         cfg.validate()
 
 
-def test_validate_requires_all_robokassa_fields(sample_pdf):
+def test_validate_prodamus_fields(sample_pdf):
     cfg = Config()
-    cfg.bot_token, cfg.product_file, cfg.public_url = "1:x", sample_pdf, ""
-    cfg.rk_login, cfg.rk_password1, cfg.rk_password2 = "shop", "p1", ""
-    with pytest.raises(ConfigError, match="все три"):
+    cfg.bot_token, cfg.product_file, cfg.public_url = "1:x", sample_pdf, "https://bot.example.ru"
+    cfg.pay_url, cfg.pay_secret = "https://aibezlesa.payform.ru", ""
+    with pytest.raises(ConfigError, match="оба поля"):
         cfg.validate()
+    cfg.pay_secret = "k"
+    cfg.validate()
+    assert cfg.payments_enabled and cfg.notify_url == "https://bot.example.ru/pay/notify"
+    cfg.pay_url = "aibezlesa.payform.ru/"
+    with pytest.raises(ConfigError, match="payform"):
+        cfg.validate()
+    cfg.pay_url, cfg.public_url = "https://aibezlesa.payform.ru", ""
+    with pytest.raises(ConfigError, match="PUBLIC_URL"):
+        cfg.validate()
+
+
+def test_profile_texts_fit_telegram_limits(sample_pdf):
+    from bot.main import profile_texts
+    cfg = Config()
+    cfg.seller_name, cfg.seller_inn = "Малютин Максим", "701760448883"
+    description, short = profile_texts(cfg)
+    assert "Малютин Максим" in description and "ИНН 701760448883" in description and "890 ₽" in description
+    assert "ИНН 701760448883" in short and "890 ₽" in short
+    assert len(description) <= 512 and len(short) <= 120
 
 
 def test_dollar_in_password_is_not_expanded(tmp_path):
@@ -43,6 +62,6 @@ def test_dollar_in_password_is_not_expanded(tmp_path):
     from deploy.set_env import get_env, set_env
     env = tmp_path / ".env"
     secret = 'a$HOME${USER}"q\\z #x'
-    set_env(env, "ROBOKASSA_PASSWORD1", secret)
-    assert get_env(env, "ROBOKASSA_PASSWORD1") == secret
-    assert dotenv_values(env, interpolate=False)["ROBOKASSA_PASSWORD1"] == secret
+    set_env(env, "PRODAMUS_SECRET", secret)
+    assert get_env(env, "PRODAMUS_SECRET") == secret
+    assert dotenv_values(env, interpolate=False)["PRODAMUS_SECRET"] == secret

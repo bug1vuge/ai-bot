@@ -1,31 +1,28 @@
-"""Веб-адреса для Робокассы:
-  POST /robokassa/result   — уведомление об оплате (Result URL)
-  GET  /robokassa/success  — сюда Робокасса возвращает покупателя после оплаты (Success URL)
-  GET  /robokassa/fail     — сюда возвращает при отказе от оплаты (Fail URL)
-  GET  /offer              — публичная оферта (текст в data/offer.md)
-  GET  /health             — проверка, что бот жив
+"""Веб-адреса бота:
+  POST /pay/notify   — уведомление Prodamus об оплате (вписывается в настройки платёжной страницы)
+  GET  /pay/success  — сюда Prodamus возвращает покупателя после оплаты → обратно в бота
+  GET  /pay/return   — сюда возвращает, если покупатель ушёл без оплаты → обратно в бота
+  GET  /offer        — публичная оферта (текст в data/offer.md)
+  GET  /health       — проверка, что бот жив
 """
+import html
 import logging
+import time
+from datetime import datetime, timezone
 
 from aiohttp import web
 
+from . import texts
 from .offer import render_offer
+from .prodamus import ProdamusError, notification_fields
 from .service import Shop
 
 log = logging.getLogger(__name__)
 
-
-async def _params(request: web.Request) -> dict:
-    data = dict(request.query)
-    if request.method == "POST":
-        try:
-            data.update(dict(await request.post()))
-        except web.HTTPException:
-            raise  # например, слишком большое тело запроса — 413
-        except Exception:
-            log.warning("Не удалось разобрать тело запроса от %s", request.remote)
-    return {k: str(v) for k, v in data.items()}
-
+# Уведомления с неверной подписью сохраняются для разбора (не больше стольких файлов)
+KEEP_REJECTED = 50
+# Администратору о неверных подписях — не чаще раза в столько секунд
+ALERT_EVERY_SEC = 600
 
 SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
@@ -48,33 +45,48 @@ async def security_headers(request: web.Request, handler):
 
 
 def make_app(shop: Shop) -> web.Application:
+    last_alert = {"t": 0.0}
+
     def bot_link(payload: str) -> str:
         return f"https://t.me/{shop.bot_username}?start={payload}" if shop.bot_username else "https://t.me"
 
-    async def result(request: web.Request) -> web.Response:
-        data = await _params(request)
+    def keep_rejected(body: bytes, reason: str) -> None:
+        """Сохраняем отклонённое уведомление: если это настоящая оплата, по файлу можно разобраться."""
+        folder = shop.cfg.db_path.parent / "rejected_notifications"
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+            (folder / f"{stamp}.txt").write_bytes(f"# {reason}\n".encode() + body)
+            for old in sorted(folder.glob("*.txt"))[:-KEEP_REJECTED]:
+                old.unlink(missing_ok=True)
+        except OSError:
+            log.exception("Не удалось сохранить отклонённое уведомление")
+
+    async def notify(request: web.Request) -> web.Response:
         if not shop.cfg.payments_enabled:
             return web.Response(status=503, text="payments disabled")
-        if data.get("IsTest") == "1" and not shop.cfg.rk_test:
-            # боевой магазин не принимает тестовые оплаты, даже с верной подписью
-            log.warning("Тестовое уведомление в боевом режиме отклонено: InvId=%s", data.get("InvId"))
-            return web.Response(status=400, text="test payment in live mode")
-        if not shop.kassa.check_result_signature(data):
-            log.warning("Неверная подпись уведомления от %s: InvId=%s", request.remote, data.get("InvId"))
-            return web.Response(status=400, text="bad sign")
+        body = await request.read()  # размер ограничен client_max_size
         try:
-            ok = await shop.handle_result(data)
+            data = shop.pay.parse_notification(body, request.content_type, request.headers.get("Sign", ""))
+        except (ProdamusError, UnicodeDecodeError) as e:
+            log.warning("Отклонено уведомление от %s: %s", request.remote, e)
+            keep_rejected(body, str(e))
+            now = time.monotonic()
+            if now - last_alert["t"] > ALERT_EVERY_SEC:
+                last_alert["t"] = now
+                await shop._notify_admins(texts.ADMIN_BAD_SIGNATURE.format(reason=html.escape(str(e))))
+            return web.Response(status=400, text=f"error: {e}")
+        try:
+            await shop.handle_notification(data)
         except Exception:
-            log.exception("Ошибка обработки уведомления %s", data.get("InvId"))
-            return web.Response(status=500, text="error")  # Робокасса повторит уведомление
-        if not ok:
-            return web.Response(status=400, text="rejected")
-        return web.Response(text=f"OK{data['InvId']}")
+            log.exception("Ошибка обработки уведомления по заказу %s", notification_fields(data)["order"])
+            return web.Response(status=500, text="error")  # Prodamus повторит уведомление
+        return web.Response(text="success")
 
     async def success(_: web.Request) -> web.Response:
         raise web.HTTPFound(bot_link("paid"))
 
-    async def fail(_: web.Request) -> web.Response:
+    async def back(_: web.Request) -> web.Response:
         raise web.HTTPFound(bot_link("fail"))
 
     async def offer(_: web.Request) -> web.Response:
@@ -86,11 +98,11 @@ def make_app(shop: Shop) -> web.Application:
             return web.Response(status=503, text="database unavailable")
         return web.Response(text="ok")
 
-    # уведомления Робокассы — несколько сотен байт; большие тела отклоняем сразу
-    app = web.Application(middlewares=[security_headers], client_max_size=64 * 1024)
-    app.router.add_route("*", "/robokassa/result", result)
-    app.router.add_route("*", "/robokassa/success", success)
-    app.router.add_route("*", "/robokassa/fail", fail)
+    # уведомления об оплате — несколько килобайт; большие тела отклоняем сразу
+    app = web.Application(middlewares=[security_headers], client_max_size=256 * 1024)
+    app.router.add_post("/pay/notify", notify)
+    app.router.add_route("*", "/pay/success", success)
+    app.router.add_route("*", "/pay/return", back)
     app.router.add_get("/offer", offer)
     app.router.add_get("/health", health)
     return app

@@ -19,7 +19,7 @@ from .db import Database
 from .handlers import router
 from .middlewares import ThrottleMiddleware
 from .offer import missing_fields
-from .robokassa import Robokassa
+from .prodamus import Prodamus
 from .service import Shop
 from .web import make_app
 
@@ -42,7 +42,7 @@ def setup_logging() -> None:
 
 
 async def connect_telegram(bot: Bot) -> str:
-    """Ждёт, пока Telegram станет доступен. Пока ждём, адреса для Робокассы уже работают:
+    """Ждёт, пока Telegram станет доступен. Пока ждём, приём уведомлений об оплате уже работает:
     оплата фиксируется, а гайд уйдёт, как только появится связь."""
     delay = 5
     while True:
@@ -58,15 +58,41 @@ async def connect_telegram(bot: Bot) -> str:
             delay = min(delay * 2, 60)
 
 
+def profile_texts(cfg: Config) -> tuple[str, str]:
+    """Описание бота (видно до нажатия «Старт») и короткое описание (в профиле бота).
+    Здесь же реквизиты продавца и цена — их требует проверка платёжной системы."""
+    price = f"{cfg.price_rub:,}".replace(",", " ")
+    seller = ""
+    if cfg.seller_name:
+        seller = f"Продавец: {cfg.seller_name}, самозанятый" + (f", ИНН {cfg.seller_inn}" if cfg.seller_inn else "")
+    description = texts.BOT_DESCRIPTION.format(price=price) + (f"\n\n{seller}" if seller else "")
+    short = texts.BOT_SHORT_DESCRIPTION.format(price=price)
+    if cfg.seller_name and cfg.seller_inn:
+        short += f" {cfg.seller_name}, ИНН {cfg.seller_inn}"
+    return description[:512], short[:120]
+
+
+async def setup_profile(bot: Bot, cfg: Config) -> None:
+    """Меню команд и описание бота. Ошибка здесь не мешает работе бота."""
+    description, short = profile_texts(cfg)
+    for name, call in (("меню команд", bot.set_my_commands(COMMANDS)),
+                       ("описание", bot.set_my_description(description)),
+                       ("короткое описание", bot.set_my_short_description(short))):
+        try:
+            await call
+        except Exception as e:
+            log.warning("Не удалось обновить %s бота: %s", name, e)
+
+
 async def run(cfg: Config, session: BaseSession | None = None) -> None:
     cfg.validate()
     db = Database(cfg.db_path)
     await db.connect()
-    kassa = Robokassa(cfg.rk_login, cfg.rk_password1, cfg.rk_password2, is_test=cfg.rk_test, algo=cfg.rk_hash)
+    pay = Prodamus(cfg.pay_url, cfg.pay_secret)
     if session is None:
         session = AiohttpSession(proxy=cfg.telegram_proxy) if cfg.telegram_proxy else AiohttpSession()
     bot = Bot(cfg.bot_token, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    shop = Shop(cfg, db, kassa, bot)
+    shop = Shop(cfg, db, pay, bot)
 
     dp = Dispatcher()
     throttle = ThrottleMiddleware()
@@ -78,7 +104,7 @@ async def run(cfg: Config, session: BaseSession | None = None) -> None:
     runner: web.AppRunner | None = None
     poller: asyncio.Task | None = None
     try:
-        # 1. Адреса для Робокассы — первыми, независимо от доступности Telegram
+        # 1. Приём уведомлений об оплате — первым, независимо от доступности Telegram
         if cfg.web_enabled:
             runner = web.AppRunner(make_app(shop), access_log=None)
             await runner.setup()
@@ -87,35 +113,28 @@ async def run(cfg: Config, session: BaseSession | None = None) -> None:
             except OSError as e:
                 raise ConfigError(f"Не удалось занять порт {cfg.web_host}:{cfg.web_port} ({e}). "
                                   "Его использует другая программа — укажите другой WEB_PORT в .env.") from None
-            log.info("Адреса для Робокассы слушаются на %s:%s", cfg.web_host, cfg.web_port)
+            log.info("Веб-сервер слушает %s:%s", cfg.web_host, cfg.web_port)
             if cfg.public_url:
-                log.info("Result URL:  %s/robokassa/result  (POST)", cfg.public_url)
-                log.info("Success URL: %s/robokassa/success (GET)", cfg.public_url)
-                log.info("Fail URL:    %s/robokassa/fail    (GET)", cfg.public_url)
-                log.info("Оферта:      %s", cfg.offer_url)
+                log.info("Адрес для уведомлений Prodamus: %s", cfg.notify_url)
+                log.info("Оферта: %s", cfg.offer_url)
 
-        # 2. Фоновая проверка оплат и повторная выдача
+        # 2. Фоновая повторная выдача и резервные копии
         poller = asyncio.create_task(shop.poll_pending(), name="poller")
 
         # 3. Telegram
         shop.bot_username = await connect_telegram(bot)
-        try:
-            await bot.set_my_commands(COMMANDS)
-        except Exception as e:
-            log.warning("Не удалось обновить меню команд: %s", e)
+        await setup_profile(bot, cfg)
 
         if missing_fields(cfg):
             log.warning("В оферте не заполнены поля: %s — впишите их в .env", ", ".join(missing_fields(cfg)))
         log.info("Бот @%s запущен. Цена %s ₽, водяной знак: %s", shop.bot_username, cfg.price_rub, cfg.watermark)
         if cfg.payments_enabled:
-            mode = "ТЕСТОВЫЙ" if cfg.rk_test else "боевой"
-            log.info("Робокасса: магазин %s, режим %s", cfg.rk_login, mode)
-            if cfg.rk_test:
-                log.warning("Тестовый режим Робокассы: деньги не списываются, а гайд выдаётся!")
-            await shop._notify_admins(texts.ADMIN_STARTED.format(mode=mode)
-                                      + (texts.TEST_MODE_WARNING if cfg.rk_test else ""))
+            mode = "тестовый (покупают только администраторы)" if cfg.test_mode else "боевой"
+            log.info("Prodamus: %s, режим %s", cfg.pay_url, mode)
+            await shop._notify_admins(texts.ADMIN_STARTED.format(mode=mode, notify_url=cfg.notify_url)
+                                      + (texts.TEST_MODE_WARNING if cfg.test_mode else ""))
         else:
-            log.warning("Данные Робокассы не указаны — режим витрины: бот всё показывает, но оплату пока не принимает.")
+            log.warning("Данные Prodamus не указаны — режим витрины: бот всё показывает, но оплату пока не принимает.")
             await shop._notify_admins(texts.ADMIN_STARTED_SHOWCASE)
 
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
@@ -128,7 +147,6 @@ async def run(cfg: Config, session: BaseSession | None = None) -> None:
         await shop.wait_background()
         if runner:
             await runner.cleanup()
-        await kassa.close()
         await db.close()
         await bot.session.close()
 

@@ -188,11 +188,11 @@ class Database:
 
     # ---------- payments ----------
     async def next_inv_id(self) -> int:
-        """Уникальный номер счёта для Робокассы (InvId) — одним атомарным запросом.
+        """Уникальный номер заказа — одним атомарным запросом.
 
         Номер не меньше текущего Unix-времени: если база потеряется или бота переустановят,
-        новые счета не совпадут со старыми в Робокассе. Иначе проверка статуса нового счёта
-        могла бы найти чужой старый оплаченный счёт с тем же номером и выдать гайд бесплатно."""
+        новые заказы не совпадут со старыми в Prodamus, и старое уведомление об оплате
+        не будет принято за оплату нового заказа."""
         floor = int(time.time())
         async with self._lock, self.conn.execute(
             """INSERT INTO counters (name, value) VALUES ('inv_id', ?)
@@ -203,7 +203,7 @@ class Database:
             return (await cur.fetchone())[0]
 
     async def ensure_inv_id_above(self, value: int) -> None:
-        """После восстановления платежа счётчик не должен выдать уже использованный номер."""
+        """После восстановления заказа счётчик не должен выдать уже использованный номер."""
         await self._write(
             """INSERT INTO counters (name, value) VALUES ('inv_id', ?)
                ON CONFLICT(name) DO UPDATE SET value = MAX(value, excluded.value)""",
@@ -212,7 +212,7 @@ class Database:
 
     async def add_payment(self, payment_id: str, user_id: int, amount: str, status: str,
                           confirmation_url: str | None, manual: bool = False, is_test: bool = False) -> bool:
-        """Добавляет счёт. False — счёт с таким номером уже есть (повтор не создаёт дубликат)."""
+        """Добавляет заказ. False — заказ с таким номером уже есть (повтор не создаёт дубликат)."""
         paid_at = iso(now()) if status == "succeeded" else None
         rows = await self._write(
             """INSERT OR IGNORE INTO payments
@@ -226,8 +226,8 @@ class Database:
         return await self._one("SELECT * FROM payments WHERE payment_id=?", (payment_id,))
 
     async def fresh_pending(self, user_id: int, ttl_min: int, amount: str, is_test: bool):
-        """Неоплаченный счёт пользователя, созданный недавно на ту же сумму и в том же режиме, —
-        чтобы не плодить ссылки. После смены цены или режима создаётся новый счёт."""
+        """Неоплаченный заказ пользователя, созданный недавно на ту же сумму и в том же режиме, —
+        чтобы не плодить ссылки. После смены цены или режима создаётся новый заказ."""
         since = iso(now() - timedelta(minutes=ttl_min))
         return await self._one(
             """SELECT * FROM payments WHERE user_id=? AND status='pending' AND created_at>=?
@@ -240,35 +240,12 @@ class Database:
         return await self._one(
             "SELECT * FROM payments WHERE user_id=? AND status='pending' ORDER BY created_at DESC LIMIT 1", (user_id,))
 
-    async def pending_for_polling(self, fresh_min: int, max_age_hours: int, slow_interval_min: int) -> list[str]:
-        """Неоплаченные счета для фоновой проверки статуса в Робокассе.
-
-        Свежие (младше fresh_min минут) проверяются каждый круг. Более старые — до max_age_hours
-        часов, но не чаще раза в slow_interval_min минут: покупатель мог открыть ссылку позже,
-        а уведомление Робокассы — не дойти."""
-        t = now()
-        return [r["payment_id"] for r in await self._all(
-            """SELECT payment_id FROM payments
-               WHERE status='pending' AND manual=0 AND created_at>=?
-                 AND (created_at>=? OR checked_at IS NULL OR checked_at<?)
-               ORDER BY created_at DESC""",
-            (iso(t - timedelta(hours=max_age_hours)), iso(t - timedelta(minutes=fresh_min)),
-             iso(t - timedelta(minutes=slow_interval_min))),
-        )]
-
-    async def mark_checked(self, payment_id: str) -> None:
-        await self._write("UPDATE payments SET checked_at=? WHERE payment_id=?", (iso(now()), payment_id))
-
     async def mark_paid(self, payment_id: str) -> None:
-        """Счёт оплачен. Отменённый ранее счёт тоже становится оплаченным: деньги важнее статуса."""
+        """Заказ оплачен."""
         await self._write(
             "UPDATE payments SET status='succeeded', paid_at=COALESCE(paid_at, ?) WHERE payment_id=?",
             (iso(now()), payment_id),
         )
-
-    async def mark_canceled(self, payment_id: str) -> None:
-        # оплаченный счёт никогда не становится отменённым
-        await self._write("UPDATE payments SET status='canceled' WHERE payment_id=? AND status='pending'", (payment_id,))
 
     async def claim_delivery(self, payment_id: str) -> bool:
         """Атомарно «забирает» выдачу: True только для одного вызова. Защита от двойной выдачи."""
@@ -293,7 +270,7 @@ class Database:
         return row[0] if row else 0
 
     async def undelivered_paid(self, max_attempts: int, due_only: bool = True) -> list[str]:
-        """Оплаченные, но не выданные счета (например, Telegram был недоступен) — для повторной выдачи."""
+        """Оплаченные, но не выданные заказы (например, Telegram был недоступен) — для повторной выдачи."""
         sql = """SELECT payment_id FROM payments
                  WHERE status='succeeded' AND delivered=? AND delivery_attempts<?"""
         params: tuple = (NOT_DELIVERED, max_attempts)
@@ -303,7 +280,7 @@ class Database:
         return [r["payment_id"] for r in await self._all(sql + " ORDER BY paid_at", params)]
 
     async def undelivered_for_user(self, user_id: int) -> list[str]:
-        """Оплаченные, но ещё не выданные счета пользователя (в том числе исчерпавшие попытки)."""
+        """Оплаченные, но ещё не выданные заказы пользователя (в том числе исчерпавшие попытки)."""
         return [r["payment_id"] for r in await self._all(
             "SELECT payment_id FROM payments WHERE user_id=? AND status='succeeded' AND delivered=? ORDER BY paid_at",
             (user_id, NOT_DELIVERED))]
@@ -313,7 +290,7 @@ class Database:
                           (payment_id,))
 
     async def count_delivered(self, user_id: int, exclude: str) -> int:
-        """Сколько других оплаченных и выданных счетов у пользователя — чтобы заметить двойную оплату."""
+        """Сколько других оплаченных и выданных заказов у пользователя — чтобы заметить двойную оплату."""
         row = await self._one(
             "SELECT COUNT(*) FROM payments WHERE user_id=? AND status='succeeded' AND delivered=? AND payment_id<>?",
             (user_id, DELIVERED, exclude))

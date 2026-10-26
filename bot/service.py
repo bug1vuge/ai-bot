@@ -1,13 +1,13 @@
-"""Бизнес-логика: создание счёта, подтверждение оплаты и выдача гайда.
+"""Бизнес-логика: создание заказа, подтверждение оплаты и выдача гайда.
 
-Оплату подтверждают три независимых пути, и все они сходятся в одной функции _deliver,
-которая атомарно отмечает выдачу — поэтому гайд приходит ровно один раз:
-  1. уведомление Робокассы на Result URL (основной путь, мгновенно);
-  2. кнопка «Я оплатил — проверить» и возврат со страницы оплаты;
-  3. фоновая проверка неоплаченных счетов через API статуса Робокассы.
-Если отправить файл не удалось (Telegram недоступен, пользователь заблокировал бота),
-фоновая проверка повторяет выдачу с нарастающей паузой в течение суток, а при следующем
-/start пользователь получает гайд сразу.
+Путь покупки: «Купить» → бот создаёт заказ и ссылку на платёжную страницу Prodamus →
+покупатель платит → Prodamus присылает подписанное уведомление на /pay/notify →
+бот отмечает заказ оплаченным, сразу отвечает Prodamus и отправляет гайд в фоне.
+
+Все пути выдачи сходятся в одной функции _deliver, которая атомарно отмечает выдачу, —
+поэтому гайд приходит ровно один раз. Если отправить файл не удалось (Telegram недоступен,
+пользователь заблокировал бота), фоновая задача повторяет выдачу с нарастающей паузой
+в течение суток, а при следующем /start пользователь получает гайд сразу.
 """
 import asyncio
 import contextlib
@@ -22,7 +22,7 @@ from aiogram.types import BufferedInputFile, FSInputFile
 from . import texts
 from .config import Config
 from .db import DELIVERED, SENDING, Database
-from .robokassa import STATE_CANCELED, STATE_PAID, Robokassa
+from .prodamus import STATUS_SUCCESS, Prodamus, notification_fields
 from .watermark import stamp_pdf
 
 log = logging.getLogger(__name__)
@@ -30,11 +30,6 @@ log = logging.getLogger(__name__)
 # Повторы выдачи: паузы между попытками (сек). Последняя пауза повторяется до MAX_DELIVERY_ATTEMPTS.
 RETRY_DELAYS = (15, 30, 60, 120, 300, 600, 1800, 3600)
 MAX_DELIVERY_ATTEMPTS = 30  # ≈ сутки попыток
-# Фоновая проверка старых неоплаченных счетов: до суток после создания, не чаще раза в 10 минут
-LATE_PAYMENT_HOURS = 24
-LATE_CHECK_EVERY_MIN = 10
-# Сколько запросов статуса к Робокассе выполнять одновременно
-POLL_CONCURRENCY = 4
 # Резервные копии базы
 BACKUP_KEEP = 14
 
@@ -56,10 +51,10 @@ def _same_amount(a, b) -> bool:
 
 
 class Shop:
-    def __init__(self, config: Config, db: Database, kassa: Robokassa, bot: Bot):
+    def __init__(self, config: Config, db: Database, pay: Prodamus, bot: Bot):
         self.cfg = config
         self.db = db
-        self.kassa = kassa
+        self.pay = pay
         self.bot = bot
         self.bot_username: str = ""
         self._file_id: str | None = None
@@ -69,7 +64,7 @@ class Shop:
 
     @contextlib.asynccontextmanager
     async def _lock(self, key: str):
-        """Блокировка по ключу (счёт или пользователь). Освобождённые блокировки удаляются,
+        """Блокировка по ключу (заказ или пользователь). Освобождённые блокировки удаляются,
         чтобы словарь не рос бесконечно."""
         entry = self._locks.setdefault(key, [asyncio.Lock(), 0])
         entry[1] += 1
@@ -81,66 +76,81 @@ class Shop:
             if entry[1] == 0:
                 self._locks.pop(key, None)
 
-    # ---------- создание счёта ----------
-    def _receipt(self) -> dict | None:
-        if not self.cfg.rk_send_receipt:
-            return None
-        return {"items": [{"name": self.cfg.receipt_item_name[:128], "quantity": 1, "sum": self.cfg.price_rub,
-                           "payment_method": "full_payment", "payment_object": "service", "tax": "none"}]}
+    # ---------- создание заказа ----------
+    @staticmethod
+    def make_order_id(number: int, user_id: int) -> str:
+        """Номер заказа содержит покупателя: если база потеряется, оплату всё равно можно привязать."""
+        return f"{number}-{user_id}"
+
+    @staticmethod
+    def user_from_order(order_id: str) -> int | None:
+        parts = order_id.split("-")
+        return int(parts[1]) if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit() else None
+
+    def _payment_url(self, order_id: str, user_id: int) -> str:
+        base = self.cfg.public_url
+        return self.pay.payment_url(
+            order_id, self.cfg.price_str, self.cfg.payment_description,
+            success_url=f"{base}/pay/success" if base else "",
+            return_url=f"{base}/pay/return" if base else "",
+            customer_extra=f"Telegram ID {user_id}",
+        )
 
     async def get_or_create_payment(self, user_id: int) -> tuple[str, str]:
-        """Возвращает (номер счёта, ссылка на оплату). Повторно использует свежую неоплаченную ссылку."""
-        # блокировка по пользователю: двойное нажатие «Купить» не создаёт два счёта
+        """Возвращает (номер заказа, ссылка на оплату). Повторно использует свежую неоплаченную ссылку."""
+        # блокировка по пользователю: двойное нажатие «Купить» не создаёт два заказа
         async with self._lock(f"user:{user_id}"):
             existing = await self.db.fresh_pending(user_id, self.cfg.payment_ttl_min,
-                                                   self.cfg.price_str, self.cfg.rk_test)
+                                                   self.cfg.price_str, self.cfg.test_mode)
             if existing and existing["confirmation_url"]:
                 return existing["payment_id"], existing["confirmation_url"]
-            inv_id = await self.db.next_inv_id()
-            url = self.kassa.payment_url(inv_id, self.cfg.price_str, self.cfg.payment_description,
-                                         shp={"Shp_user": user_id}, receipt=self._receipt())
-            await self.db.add_payment(str(inv_id), user_id, self.cfg.price_str, "pending", url,
-                                      is_test=self.cfg.rk_test)
-        log.info("Создан счёт %s для %s", inv_id, user_id)
-        return str(inv_id), url
+            order_id = self.make_order_id(await self.db.next_inv_id(), user_id)
+            url = self._payment_url(order_id, user_id)
+            await self.db.add_payment(order_id, user_id, self.cfg.price_str, "pending", url,
+                                      is_test=self.cfg.test_mode)
+        log.info("Создан заказ %s для %s", order_id, user_id)
+        return order_id, url
 
-    # ---------- путь 1: уведомление Result URL ----------
-    async def handle_result(self, data: dict) -> bool:
-        """Уведомление Робокассы (подпись уже проверена): отмечаем оплату и сразу отвечаем.
-        Гайд отправляется в фоне, чтобы медленный Telegram не задерживал ответ Робокассе.
-        True — уведомление принято."""
-        inv_id = str(data.get("InvId", "")).strip()
-        user = str(data.get("Shp_user", "")).strip()
-        async with self._lock(inv_id):
-            row = await self.db.get_payment(inv_id)
+    # ---------- уведомление Prodamus ----------
+    async def handle_notification(self, data: dict) -> bool:
+        """Уведомление Prodamus (подпись уже проверена): отмечаем оплату и сразу отвечаем.
+        Гайд отправляется в фоне, чтобы медленный Telegram не задерживал ответ Prodamus.
+        True — уведомление принято (в том числе неуспешный статус, который не требует действий)."""
+        f = notification_fields(data)
+        order = f["order"]
+        if f["status"] != STATUS_SUCCESS:
+            log.info("Заказ %s: уведомление со статусом «%s» (%s) — не оплата, пропускаю",
+                     order, f["status"], f["status_text"])
+            return True
+        async with self._lock(order):
+            row = await self.db.get_payment(order) if order else None
             if row is None:
-                if not (inv_id.isdigit() and user.isdigit()):
-                    log.error("Уведомление о неизвестном счёте %s без покупателя", inv_id)
+                user = self.user_from_order(order)
+                if user is None:
+                    log.error("Оплата неизвестного заказа «%s» (Prodamus %s)", order, f["prodamus_order"])
                     await self._notify_admins(texts.ADMIN_RESULT_REJECTED.format(
-                        payment_id=html.escape(inv_id), reason="счёта нет в базе и не указан покупатель"))
-                    return False
-                # Счёта нет в базе (например, база потерялась при переезде) — восстанавливаем из
-                # уведомления. Сумма подписана Робокассой, поэтому берём её из уведомления.
-                amount = _amount(data.get("OutSum"))
-                await self.db.add_payment(inv_id, int(user), f"{amount or self.cfg.price_str}", "pending", None,
-                                          is_test=self.cfg.rk_test)
-                await self.db.ensure_inv_id_above(int(inv_id))
-                row = await self.db.get_payment(inv_id)
-                log.warning("Счёт %s восстановлен из уведомления для %s", inv_id, user)
-            if user and user != str(row["user_id"]):
-                log.error("Счёт %s: покупатель в уведомлении (%s) не совпадает с базой", inv_id, user)
+                        payment_id=html.escape(order or "—"),
+                        reason=f"заказа нет в базе (заказ в Prodamus {html.escape(f['prodamus_order'])}, "
+                               f"сумма {html.escape(f['sum'])})"))
+                    return True  # повтор уведомления ничего не изменит — разбирается администратор
+                # Заказа нет в базе (например, база потерялась при переезде) — восстанавливаем.
+                # Сумма подписана Prodamus, поэтому берём её из уведомления.
+                amount = _amount(f["sum"])
+                await self.db.add_payment(order, user, f"{amount or self.cfg.price_str}", "pending", None,
+                                          is_test=self.cfg.test_mode)
+                await self.db.ensure_inv_id_above(int(order.split("-")[0]))
+                row = await self.db.get_payment(order)
+                log.warning("Заказ %s восстановлен из уведомления для %s", order, user)
+            if not _same_amount(f["sum"], row["amount"]):
+                log.error("Заказ %s: оплачено %s вместо %s", order, f["sum"], row["amount"])
                 await self._notify_admins(texts.ADMIN_RESULT_REJECTED.format(
-                    payment_id=inv_id, reason=f"покупатель {html.escape(user)} не совпадает с {row['user_id']}"))
-                return False
-            if not _same_amount(data.get("OutSum"), row["amount"]):
-                log.error("Счёт %s: сумма %s не совпадает с ожидаемой %s", inv_id, data.get("OutSum"), row["amount"])
-                await self._notify_admins(texts.ADMIN_RESULT_REJECTED.format(
-                    payment_id=inv_id, reason=f"сумма {html.escape(str(data.get('OutSum')))} вместо {row['amount']}"))
-                return False
+                    payment_id=html.escape(order),
+                    reason=f"оплачено {html.escape(f['sum'])} ₽ вместо {row['amount']} ₽"))
+                return True  # деньги получены, но сумма другая — решает администратор
             if row["status"] != "succeeded":
-                await self.db.mark_paid(inv_id)
-                log.info("Счёт %s оплачен (уведомление Робокассы)", inv_id)
-        self.deliver_in_background(inv_id)
+                await self.db.mark_paid(order)
+                log.info("Заказ %s оплачен (Prodamus %s)", order, f["prodamus_order"])
+        self.deliver_in_background(order)
         return True
 
     def deliver_in_background(self, payment_id: str) -> None:
@@ -153,44 +163,36 @@ class Shop:
             await self._deliver(payment_id)
         except Exception:
             # оплата уже отмечена — фоновая проверка повторит выдачу
-            log.exception("Ошибка фоновой выдачи по счёту %s", payment_id)
+            log.exception("Ошибка фоновой выдачи по заказу %s", payment_id)
 
     async def wait_background(self, timeout: float = 15) -> None:
         """При остановке бота даём закончиться начатым выдачам."""
         if self._tasks:
             await asyncio.wait(set(self._tasks), timeout=timeout)
 
-    # ---------- пути 2 и 3: проверка статуса ----------
+    # ---------- проверка заказа (кнопка «Я оплатил», возврат со страницы оплаты) ----------
     async def process_payment(self, payment_id: str) -> str:
-        """Проверяет счёт и выдаёт гайд, если он оплачен.
+        """Проверяет заказ и выдаёт гайд, если он оплачен.
 
         Возвращает: succeeded — гайд только что отправлен; already_delivered — гайд был выдан раньше;
         in_progress — гайд отправляется прямо сейчас; delivery_failed — оплачен, но файл не отправился
         (бот повторит); pending / canceled / unknown — оплаты нет."""
+        row = await self.db.get_payment(payment_id)
+        if row is None:
+            return "unknown"
+        if row["status"] != "succeeded":
+            return "canceled" if row["status"] == "canceled" else "pending"
+        return await self._deliver(payment_id)
+
+    async def confirm_manually(self, payment_id: str) -> str:
+        """Администратор увидел оплату в кабинете Prodamus, а уведомление не пришло."""
         async with self._lock(payment_id):
             row = await self.db.get_payment(payment_id)
             if row is None:
                 return "unknown"
             if row["status"] != "succeeded":
-                if not self.cfg.payments_enabled or row["manual"]:
-                    return "pending"
-                try:
-                    st = await self.kassa.op_state(payment_id)
-                except Exception as e:
-                    log.warning("Не удалось запросить статус счёта %s: %s", payment_id, e)
-                    st = {"result": None, "state": None, "out_sum": None}
-                await self.db.mark_checked(payment_id)
-                if st["result"] == 0 and st["state"] == STATE_PAID:
-                    if st["out_sum"] is not None and not _same_amount(st["out_sum"], row["amount"]):
-                        log.error("Счёт %s оплачен на другую сумму: %s", payment_id, st["out_sum"])
-                        return "unknown"
-                    await self.db.mark_paid(payment_id)
-                    log.info("Счёт %s оплачен (проверка статуса)", payment_id)
-                elif st["result"] == 0 and st["state"] == STATE_CANCELED:
-                    await self.db.mark_canceled(payment_id)
-                    return "canceled"
-                else:
-                    return "canceled" if row["status"] == "canceled" else "pending"
+                await self.db.mark_paid(payment_id)
+                log.warning("Заказ %s отмечен оплаченным вручную администратором", payment_id)
         return await self._deliver(payment_id)
 
     async def deliver_pending_for_user(self, user_id: int) -> bool:
@@ -202,32 +204,19 @@ class Shop:
         return sent
 
     async def poll_pending(self) -> None:
-        """Фоновая проверка — на случай, если уведомление не дошло или файл не отправился."""
+        """Фоновая задача: повторная выдача, если файл не отправился, и резервные копии."""
         while True:
             await asyncio.sleep(self.cfg.poll_interval_sec)
             await self.poll_once()
 
     async def poll_once(self) -> None:
-        """Один проход: проверить неоплаченные счета, повторить невыданное, сделать копию базы."""
+        """Один проход: повторить невыданное и сделать копию базы."""
         try:
-            if self.cfg.payments_enabled:
-                pending = await self.db.pending_for_polling(self.cfg.payment_ttl_min, LATE_PAYMENT_HOURS,
-                                                            LATE_CHECK_EVERY_MIN)
-                sem = asyncio.Semaphore(POLL_CONCURRENCY)
-
-                async def check(pid: str) -> None:
-                    async with sem:
-                        try:
-                            await self.process_payment(pid)
-                        except Exception:
-                            log.exception("Ошибка проверки счёта %s", pid)
-
-                await asyncio.gather(*(check(pid) for pid in pending))
             for pid in await self.db.undelivered_paid(MAX_DELIVERY_ATTEMPTS):
                 try:
                     await self._deliver(pid)
                 except Exception:
-                    log.exception("Ошибка повторной выдачи по счёту %s", pid)
+                    log.exception("Ошибка повторной выдачи по заказу %s", pid)
             await self._daily_backup()
         except Exception:
             log.exception("Ошибка фоновой проверки")
@@ -249,7 +238,7 @@ class Shop:
 
     # ---------- выдача ----------
     async def _deliver(self, payment_id: str) -> str:
-        """Отправляет гайд по оплаченному счёту ровно один раз.
+        """Отправляет гайд по оплаченному заказу ровно один раз.
         Возвращает succeeded / already_delivered / in_progress / delivery_failed."""
         if not await self.db.claim_delivery(payment_id):
             row = await self.db.get_payment(payment_id)
@@ -271,7 +260,7 @@ class Shop:
             raise
         except Exception as e:
             attempts = await self.db.release_delivery(payment_id, retry_delay(row["delivery_attempts"] + 1))
-            log.warning("Счёт %s: гайд не отправлен пользователю %s (попытка %s): %s",
+            log.warning("Заказ %s: гайд не отправлен пользователю %s (попытка %s): %s",
                         payment_id, user_id, attempts, e)
             # администратору — о первой неудаче и когда попытки закончились, без спама на каждом круге
             if attempts == 1 or attempts >= MAX_DELIVERY_ATTEMPTS:
@@ -283,7 +272,7 @@ class Shop:
                     await self.bot.send_message(user_id, texts.DELIVERY_ERROR)
             return "delivery_failed"
         await self.db.finish_delivery(payment_id)
-        log.info("Счёт %s: гайд выдан пользователю %s", payment_id, user_id)
+        log.info("Заказ %s: гайд выдан пользователю %s", payment_id, user_id)
         if not row["manual"]:
             await self._notify_sale(row)
         return "succeeded"

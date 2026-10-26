@@ -10,7 +10,8 @@ from aiogram.types import Chat, Document, Message, Update, User
 from bot.db import Database
 from bot.handlers import router
 from bot.service import Shop
-from tests.test_shop import FakeKassa, make_cfg
+from bot.prodamus import Prodamus
+from tests.test_shop import make_cfg, notification, paid
 
 USER = User(id=111, is_bot=False, first_name="Иван", username="ivan")
 CHAT = Chat(id=111, type="private")
@@ -40,7 +41,6 @@ class RecordingSession(BaseSession):
 async def env(tmp_path, sample_pdf):
     cfg = make_cfg(tmp_path, sample_pdf)
     cfg.admin_ids = []
-    cfg.rk_test_public = True
     cfg.seller_info = "Иванов Иван, самозанятый, ИНН 123456789012"
     cfg.offer_url = "https://example.com/offer"
     cfg.support_username = "help_me"
@@ -49,7 +49,7 @@ async def env(tmp_path, sample_pdf):
     await db.connect()
     session = RecordingSession()
     bot = Bot("123456:" + "A" * 35, session=session)
-    shop = Shop(cfg, db, FakeKassa(), bot)
+    shop = Shop(cfg, db, Prodamus(cfg.pay_url, cfg.pay_secret), bot)
     shop.bot_username = "guide_bot"
     dp = Dispatcher()
     dp.include_router(router)
@@ -86,15 +86,16 @@ async def test_full_purchase_flow(env):
     pay_msg = [c for c in session.calls if isinstance(c, SendMessage)][-1]
     assert "оферты" in pay_msg.text
     button_url = pay_msg.reply_markup.inline_keyboard[0][0].url
-    assert button_url.startswith("https://auth.robokassa.ru/Merchant/Index.aspx?") and "IsTest=1" in button_url
+    assert button_url.startswith("https://aibezlesa.payform.ru/?") and "do=pay" in button_url
     pid = pay_msg.reply_markup.inline_keyboard[1][0].callback_data.split(":")[1]
 
     await dp.feed_update(bot, cb_update(3, f"check:{pid}"))
     assert "пока не поступила" in texts_of(session)[-1]
 
-    shop.kassa.states[pid] = {"result": 0, "state": 100, "out_sum": "890.00"}
-    await dp.feed_update(bot, msg_update(4, "/start paid"))   # вернулся со страницы оплаты (Success URL)
+    await paid(shop, notification(pid))                        # Prodamus прислал уведомление
     assert any("Оплата прошла" in t for t in texts_of(session))
+    await dp.feed_update(bot, msg_update(4, "/start paid"))   # вернулся со страницы оплаты
+    assert "уже отправлен" in texts_of(session)[-1]
     assert sum(isinstance(c, SendDocument) for c in session.calls) == 1
 
     await dp.feed_update(bot, msg_update(5, "/my"))
@@ -121,9 +122,9 @@ async def test_admin_stats(env):
 
 
 async def test_showcase_mode_without_keys(env):
-    """Без данных Робокассы бот показывает экран оплаты, но счёт не создаёт."""
+    """Без данных Prodamus бот показывает экран оплаты, но заказ не создаёт."""
     dp, bot, shop, session = env
-    shop.cfg.rk_login = shop.cfg.rk_password1 = shop.cfg.rk_password2 = ""
+    shop.cfg.pay_url = shop.cfg.pay_secret = ""
     await dp.feed_update(bot, msg_update(30, "/start"))
     await dp.feed_update(bot, cb_update(31, "buy"))
     pay_msg = [c for c in session.calls if isinstance(c, SendMessage)][-1]
@@ -155,10 +156,9 @@ def docs_of(session):
 
 
 async def paid_user(shop):
-    from tests.test_shop import paid, result_params
     await shop.db.upsert_user(111, "ivan", "Иван", None)
     pid, _ = await shop.get_or_create_payment(111)
-    await paid(shop, result_params(pid))
+    await paid(shop, notification(pid))
     return pid
 
 
@@ -238,6 +238,11 @@ async def test_admin_grant_and_check(env):
     assert "был выдан раньше" in texts_of(session)[-1]
     await dp.feed_update(bot, msg_update(103, "/check abc"))
     assert "Использование" in texts_of(session)[-1]
+    pid2, _ = await shop.get_or_create_payment(222)
+    await dp.feed_update(bot, msg_update(104, f"/paid {pid2}"))   # оплата видна в кабинете, уведомления нет
+    assert "отправлен сейчас" in texts_of(session)[-1] and await shop.db.has_paid(222)
+    await dp.feed_update(bot, msg_update(105, "/paid 1; DROP"))
+    assert "Использование" in texts_of(session)[-1]
 
 
 async def test_throttle_drops_flood(tmp_path, sample_pdf):
@@ -247,7 +252,7 @@ async def test_throttle_drops_flood(tmp_path, sample_pdf):
     await db.connect()
     session = RecordingSession()
     bot = Bot("123456:" + "A" * 35, session=session)
-    shop = Shop(cfg, db, FakeKassa(), bot)
+    shop = Shop(cfg, db, Prodamus(cfg.pay_url, cfg.pay_secret), bot)
     dp = Dispatcher()
     t = ThrottleMiddleware(interval=10)
     dp.message.outer_middleware(t)
@@ -264,12 +269,11 @@ async def test_throttle_drops_flood(tmp_path, sample_pdf):
 
 
 async def test_return_before_notification_waits_and_delivers(env, monkeypatch):
-    """Покупатель вернулся со страницы оплаты раньше уведомления Робокассы:
+    """Покупатель вернулся со страницы оплаты раньше уведомления Prodamus:
     бот подождёт, а не скажет «оплата не поступила»."""
     import asyncio
 
     import bot.handlers as handlers
-    from tests.test_shop import result_params
     monkeypatch.setattr(handlers, "RETURN_CHECK_PAUSE", 0.05)
     dp, bot, shop, session = env
     await shop.db.upsert_user(111, "ivan", "Иван", None)
@@ -277,7 +281,7 @@ async def test_return_before_notification_waits_and_delivers(env, monkeypatch):
 
     async def notify_later():
         await asyncio.sleep(0.12)
-        await shop.handle_result(result_params(pid))
+        await shop.handle_notification(notification(pid))
     task = asyncio.create_task(notify_later())
     await dp.feed_update(bot, msg_update(300, "/start paid"))
     await task
@@ -300,7 +304,6 @@ async def test_return_without_payment_says_pending(env, monkeypatch):
 
 async def test_start_delivers_undelivered_guide(env, monkeypatch):
     dp, bot, shop, session = env
-    from tests.test_shop import result_params
     await shop.db.upsert_user(111, "ivan", "Иван", None)
     pid, _ = await shop.get_or_create_payment(111)
     real = session.make_request
@@ -310,7 +313,7 @@ async def test_start_delivers_undelivered_guide(env, monkeypatch):
             raise RuntimeError("Forbidden: bot was blocked by the user")
         return await real(bot_, method, timeout)
     session.make_request = blocked
-    await shop.handle_result(result_params(pid))
+    await shop.handle_notification(notification(pid))
     await shop.wait_background()
     assert docs_of(session) == 0
     session.make_request = real                   # пользователь разблокировал бота
@@ -319,9 +322,9 @@ async def test_start_delivers_undelivered_guide(env, monkeypatch):
 
 
 async def test_test_mode_is_closed_for_regular_users(env):
-    """В тестовом режиме гайд выдаётся без денег — обычный пользователь ссылку на оплату не получает."""
+    """Тестовый режим: ссылку на оплату получают только администраторы."""
     dp, bot, shop, session = env
-    shop.cfg.rk_test_public = False
+    shop.cfg.test_mode = True
     await dp.feed_update(bot, msg_update(400, "/start"))
     await dp.feed_update(bot, cb_update(401, "buy"))
     pay_msg = [c for c in session.calls if isinstance(c, SendMessage)][-1]
@@ -330,7 +333,7 @@ async def test_test_mode_is_closed_for_regular_users(env):
     shop.cfg.admin_ids = [111]                         # администратор может проверить оплату
     await dp.feed_update(bot, cb_update(402, "buy"))
     pay_msg = [c for c in session.calls if isinstance(c, SendMessage)][-1]
-    assert "IsTest=1" in pay_msg.reply_markup.inline_keyboard[0][0].url
-    shop.cfg.admin_ids, shop.cfg.rk_test = [], False   # боевой режим — покупают все
+    assert "payform.ru" in pay_msg.reply_markup.inline_keyboard[0][0].url
+    shop.cfg.admin_ids, shop.cfg.test_mode = [], False   # боевой режим — покупают все
     await dp.feed_update(bot, cb_update(403, "buy"))
     assert [c for c in session.calls if isinstance(c, SendMessage)][-1].reply_markup.inline_keyboard[0][0].url

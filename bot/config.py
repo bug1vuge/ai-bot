@@ -1,5 +1,6 @@
 """Настройки бота. Все значения берутся из переменных окружения (файл .env)."""
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -51,17 +52,14 @@ def _env(name: str, default: str = "") -> str:
 class Config:
     bot_token: str = field(default_factory=lambda: _env("BOT_TOKEN"))
 
-    # ---- Робокасса ----
-    rk_login: str = field(default_factory=lambda: _env("ROBOKASSA_LOGIN"))
-    rk_password1: str = field(default_factory=lambda: _env("ROBOKASSA_PASSWORD1"))
-    rk_password2: str = field(default_factory=lambda: _env("ROBOKASSA_PASSWORD2"))
-    rk_test: bool = field(default_factory=lambda: _bool("ROBOKASSA_TEST", True))
-    # В тестовом режиме гайд выдаётся без настоящей оплаты, поэтому покупать могут только
-    # администраторы. true — открыть тестовую покупку всем (например, для проверки модератором).
-    rk_test_public: bool = field(default_factory=lambda: _bool("ROBOKASSA_TEST_PUBLIC", False))
-    rk_hash: str = field(default_factory=lambda: _env("ROBOKASSA_HASH", "md5").lower())
-    rk_send_receipt: bool = field(default_factory=lambda: _bool("ROBOKASSA_SEND_RECEIPT", False))
-    receipt_item_name: str = field(default_factory=lambda: _env("RECEIPT_ITEM_NAME", "Электронное руководство ИИ без тёмного леса, PDF"))
+    # ---- Prodamus ----
+    # Адрес платёжной страницы, например https://aibezlesa.payform.ru
+    pay_url: str = field(default_factory=lambda: _env("PRODAMUS_URL").rstrip("/"))
+    # Секретный ключ платёжной страницы (Настройки → Уведомления / Интеграции)
+    pay_secret: str = field(default_factory=lambda: _env("PRODAMUS_SECRET"))
+    # Тестовый режим: покупать могут только администраторы (ADMIN_IDS). Включайте, пока платёжная
+    # страница в демо-режиме или идёт проверка: тогда гайд не уйдёт посторонним без настоящей оплаты.
+    test_mode: bool = field(default_factory=lambda: _bool("PAYMENTS_TEST_MODE", False))
 
     # ---- товар ----
     price_rub: int = field(default_factory=lambda: _int("PRICE_RUB", 890, minimum=1))
@@ -81,7 +79,7 @@ class Config:
     seller_email: str = field(default_factory=lambda: _env("SELLER_EMAIL"))
     seller_info: str = field(default_factory=lambda: _env("SELLER_INFO"))
 
-    # ---- веб-сервер для уведомлений Робокассы ----
+    # ---- веб-сервер для уведомлений об оплате ----
     web_enabled: bool = field(default_factory=lambda: _bool("WEB_ENABLED", True))
     web_host: str = field(default_factory=lambda: _env("WEB_HOST", "127.0.0.1"))
     web_port: int = field(default_factory=lambda: _int("WEB_PORT", 8080, minimum=1))
@@ -92,7 +90,7 @@ class Config:
     telegram_proxy: str = field(default_factory=lambda: _env("TELEGRAM_PROXY"))
 
     # ---- техническое ----
-    poll_interval_sec: int = field(default_factory=lambda: _int("POLL_INTERVAL_SEC", 30, minimum=5))
+    poll_interval_sec: int = field(default_factory=lambda: _int("POLL_INTERVAL_SEC", 15, minimum=1))
     payment_ttl_min: int = field(default_factory=lambda: _int("PAYMENT_TTL_MIN", 60, minimum=5))
     db_path: Path = field(default_factory=lambda: BASE_DIR / _env("DB_PATH", "data/bot.db"))
 
@@ -105,31 +103,38 @@ class Config:
 
     @property
     def payments_enabled(self) -> bool:
-        """Без данных Робокассы бот работает в режиме витрины: всё показывает, но оплату не принимает."""
-        return bool(self.rk_login and self.rk_password1 and self.rk_password2)
+        """Без данных Prodamus бот работает в режиме витрины: всё показывает, но оплату не принимает."""
+        return bool(self.pay_url and self.pay_secret and self.public_url)
 
     def can_buy(self, user_id: int) -> bool:
         """Можно ли этому пользователю выдать ссылку на оплату."""
         if not self.payments_enabled:
             return False
-        return not self.rk_test or self.rk_test_public or user_id in self.admin_ids
+        return not self.test_mode or user_id in self.admin_ids
 
     def validate(self) -> None:
         if not self.bot_token:
             raise ConfigError("Не заполнен BOT_TOKEN в файле .env")
-        filled = [bool(self.rk_login), bool(self.rk_password1), bool(self.rk_password2)]
-        if any(filled) and not all(filled):
-            raise ConfigError("Заполните все три поля Робокассы (ROBOKASSA_LOGIN, ROBOKASSA_PASSWORD1, "
-                             "ROBOKASSA_PASSWORD2) или оставьте все пустыми")
-        if self.rk_hash not in {"md5", "sha1", "sha256", "sha384", "sha512"}:
-            raise ConfigError("ROBOKASSA_HASH должен быть одним из: md5, sha1, sha256, sha384, sha512")
+        if bool(self.pay_url) != bool(self.pay_secret):
+            raise ConfigError("Заполните оба поля Prodamus (PRODAMUS_URL и PRODAMUS_SECRET) или оставьте оба пустыми")
+        if self.pay_url and not re.fullmatch(r"https://[a-z0-9.-]+", self.pay_url):
+            raise ConfigError("PRODAMUS_URL — адрес платёжной страницы вида https://имя.payform.ru, "
+                              f"сейчас: «{self.pay_url}»")
+        if self.pay_url and not self.public_url:
+            raise ConfigError("Для приёма оплаты нужен PUBLIC_URL — адрес бота с https://, на него Prodamus "
+                              "присылает уведомления об оплате")
         if not 1 <= self.web_port <= 65535:
             raise ConfigError(f"WEB_PORT должен быть от 1 до 65535, сейчас: {self.web_port}")
         if self.public_url and not self.public_url.startswith("https://"):
-            raise ConfigError("PUBLIC_URL должен начинаться с https:// — Робокасса работает только с HTTPS")
+            raise ConfigError("PUBLIC_URL должен начинаться с https:// — уведомления об оплате принимаются только по HTTPS")
         if not self.product_file.exists():
             raise ConfigError(f"Не найден файл продукта: {self.product_file}. Положите PDF в папку data/.")
 
     @property
     def price_str(self) -> str:
         return f"{self.price_rub:.2f}"
+
+    @property
+    def notify_url(self) -> str:
+        """Адрес для уведомлений об оплате — его вписывают в настройках платёжной страницы Prodamus."""
+        return f"{self.public_url}/pay/notify" if self.public_url else ""

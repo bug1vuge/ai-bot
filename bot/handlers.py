@@ -3,6 +3,7 @@ import asyncio
 import contextlib
 import html
 import logging
+import re
 import time
 
 from aiogram import Bot, F, Router
@@ -21,6 +22,7 @@ router.callback_query.filter(F.message.chat.type == "private")
 # Повторная отправка файла не чаще, чем раз в столько секунд на пользователя
 RESEND_COOLDOWN_SEC = 20
 _last_sent: dict[int, float] = {}
+_ORDER_RE = re.compile(r"\d{1,12}-\d{1,20}")
 # После возврата со страницы оплаты ждём подтверждения столько раз с такой паузой (≈ 20 с)
 RETURN_CHECKS, RETURN_CHECK_PAUSE = 8, 2.5
 
@@ -83,10 +85,10 @@ async def start(message: Message, command: CommandObject, shop: Shop, bot: Bot):
         return
     paid = await shop.db.has_paid(user.id)
 
-    # Пользователь вернулся со страницы оплаты (Success URL / Fail URL Робокассы)
+    # Пользователь вернулся со страницы оплаты Prodamus (кнопка возврата в магазин)
     if payload == "paid":
         if paid:
-            # гайд уже пришёл по уведомлению Робокассы — не дублируем файл
+            # гайд уже пришёл по уведомлению об оплате — не дублируем файл
             await message.answer(texts.PAID_ALREADY_SENT, reply_markup=main_kb(shop, True))
             return
         pending = await shop.db.latest_pending(user.id)
@@ -149,7 +151,7 @@ async def check(call: CallbackQuery, shop: Shop, bot: Bot):
 
 
 async def _wait_for_payment(bot: Bot, shop: Shop, user_id: int, payment_id: str):
-    """Покупатель вернулся со страницы оплаты раньше, чем дошло уведомление Робокассы.
+    """Покупатель вернулся со страницы оплаты раньше, чем дошло уведомление Prodamus.
     Несколько секунд ждём подтверждения, чтобы не пугать его «оплата не поступила»."""
     await _send(bot, user_id, texts.CHECKING_PAYMENT)
     status = "pending"
@@ -294,18 +296,32 @@ async def grant(message: Message, command: CommandObject, shop: Shop):
 
 @router.message(Command("check"))
 async def admin_check(message: Message, command: CommandObject, shop: Shop):
-    """Ручная проверка счёта по номеру (InvId) из личного кабинета Робокассы."""
+    """Проверка заказа по номеру (как в личном кабинете Prodamus, поле «Номер заказа»)."""
     if not _is_admin(shop, message.from_user.id):
         return await fallback(message, shop)
     pid = (command.args or "").strip()
     if not shop.cfg.payments_enabled:
-        await message.answer("Данные Робокассы ещё не указаны в .env — проверять нечего.")
+        await message.answer("Данные Prodamus ещё не указаны в .env — проверять нечего.")
         return
-    if not pid.isdigit():
-        await message.answer("Использование: <code>/check номер_счёта</code>")
+    if not _ORDER_RE.fullmatch(pid):
+        await message.answer("Использование: <code>/check номер_заказа</code>, например <code>/check 1793005224-111</code>")
         return
     status = await shop.process_payment(pid)
-    await message.answer(f"Счёт <code>{pid}</code>: {texts.ADMIN_STATUS.get(status, status)}")
+    await message.answer(f"Заказ <code>{pid}</code>: {texts.ADMIN_STATUS.get(status, status)}")
+
+
+@router.message(Command("paid"))
+async def admin_paid(message: Message, command: CommandObject, shop: Shop):
+    """Подтвердить оплату вручную — если в кабинете Prodamus оплата есть, а уведомление до бота не дошло."""
+    if not _is_admin(shop, message.from_user.id):
+        return await fallback(message, shop)
+    pid = (command.args or "").strip()
+    if not _ORDER_RE.fullmatch(pid):
+        await message.answer("Использование: <code>/paid номер_заказа</code> — только после того, как увидели "
+                             "оплату в личном кабинете Prodamus.")
+        return
+    status = await shop.confirm_manually(pid)
+    await message.answer(f"Заказ <code>{pid}</code>: {texts.ADMIN_STATUS.get(status, status)}")
 
 
 @router.message()
