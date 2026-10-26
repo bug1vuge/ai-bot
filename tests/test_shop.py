@@ -9,7 +9,7 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 from pypdf import PdfReader
 
-from bot.config import BASE_DIR, Config
+from bot.config import Config
 from bot.db import Database
 from bot.robokassa import Robokassa, parse_op_state
 from bot.service import Shop
@@ -49,11 +49,11 @@ class FakeBot:
         return SimpleNamespace(document=SimpleNamespace(file_id="FILEID"))
 
 
-def make_cfg(tmp_path):
+def make_cfg(tmp_path, product_file):
     cfg = Config()
     cfg.rk_login, cfg.rk_password1, cfg.rk_password2, cfg.rk_test = LOGIN, P1, P2, True
     cfg.db_path = tmp_path / "t.db"
-    cfg.product_file = BASE_DIR / "data" / "guide.pdf"
+    cfg.product_file = product_file
     cfg.admin_ids = [999]
     cfg.price_rub = 890
     cfg.watermark = True
@@ -62,8 +62,8 @@ def make_cfg(tmp_path):
 
 
 @pytest.fixture
-async def shop(tmp_path):
-    cfg = make_cfg(tmp_path)
+async def shop(tmp_path, sample_pdf):
+    cfg = make_cfg(tmp_path, sample_pdf)
     db = Database(cfg.db_path)
     await db.connect()
     await db.upsert_user(USER, "ivan", "Иван", "tiktok")

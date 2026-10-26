@@ -7,7 +7,6 @@ from aiogram.client.session.base import BaseSession
 from aiogram.methods import SendDocument, SendMessage
 from aiogram.types import Chat, Document, Message, Update, User
 
-from bot.config import BASE_DIR, Config
 from bot.db import Database
 from bot.handlers import router
 from bot.service import Shop
@@ -38,8 +37,8 @@ class RecordingSession(BaseSession):
 
 
 @pytest.fixture
-async def env(tmp_path):
-    cfg = make_cfg(tmp_path)
+async def env(tmp_path, sample_pdf):
+    cfg = make_cfg(tmp_path, sample_pdf)
     cfg.admin_ids = []
     cfg.seller_info = "Иванов Иван, самозанятый, ИНН 123456789012"
     cfg.offer_url = "https://example.com/offer"
