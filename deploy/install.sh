@@ -22,14 +22,18 @@ die()  { echo -e "\033[1;31m[x] $*\033[0m"; exit 1; }
 command -v apt-get >/dev/null || die "Скрипт рассчитан на Ubuntu/Debian (нужен apt-get)."
 
 # все ли файлы на месте (частая причина ошибок — неполная загрузка или вложенная папка guide-bot/guide-bot)
-for f in requirements.txt bot/main.py data/guide.pdf data/offer.md wheels .env.example; do
+for f in requirements.txt bot/main.py data/offer.md .env.example; do
   if [[ ! -e "$SRC_DIR/$f" ]]; then
     hint=""
     [[ -d "$SRC_DIR/guide-bot" ]] && hint="
     Внутри есть вложенная папка guide-bot — объедините её: cd $SRC_DIR && cp -an guide-bot/. ./ && rm -rf guide-bot"
-    die "В папке $SRC_DIR нет «$f». Загрузите на сервер полный архив guide-bot.zip.$hint"
+    die "В папке $SRC_DIR нет «$f». Загрузите проект целиком (git clone или полный архив).$hint"
   fi
 done
+# сам гайд в git не хранится: его кладут в data/ отдельно (или он уже есть с прошлой установки)
+if [[ ! -f "$SRC_DIR/data/guide.pdf" && ! -f "$APP_DIR/data/guide.pdf" ]]; then
+  die "Нет файла гайда data/guide.pdf. Загрузите PDF в $SRC_DIR/data/guide.pdf (через FileZilla или scp) и запустите скрипт снова."
+fi
 
 # ---------------------------------------------------------------- пакеты
 say "Устанавливаю системные пакеты"
@@ -80,7 +84,8 @@ id "$APP_USER" &>/dev/null || useradd --system --home-dir "$APP_DIR" --shell /us
 mkdir -p "$APP_DIR/data"
 if [[ "$SRC_DIR" != "$APP_DIR" ]]; then
   # код обновляем, а .env, базу и venv не трогаем
-  tar -C "$SRC_DIR" --exclude='./.env' --exclude='./data/bot.db' --exclude='./venv' --exclude='./wheels/*win_amd64*' -cf - . | tar -C "$APP_DIR" -xf -
+  tar -C "$SRC_DIR" --exclude='./.git' --exclude='./.env' --exclude='./data/bot.db*' --exclude='./venv' \
+      --exclude='*/__pycache__' --exclude='./wheels/*win_amd64*' -cf - . | tar -C "$APP_DIR" -xf -
   if [[ -f "$SRC_DIR/.env" && ! -f "$APP_DIR/.env" ]]; then cp "$SRC_DIR/.env" "$APP_DIR/.env"; fi
 fi
 [[ -f "$APP_DIR/.env" ]] || cp "$APP_DIR/.env.example" "$APP_DIR/.env"
@@ -127,9 +132,11 @@ fi
 say "Готовлю окружение Python"
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' || die "Нужен Python 3.10 или новее."
 [[ -x "$APP_DIR/venv/bin/python" ]] || python3 -m venv "$APP_DIR/venv"
-"$APP_DIR/venv/bin/pip" install --disable-pip-version-check -q --no-index --find-links "$APP_DIR/wheels" -r "$APP_DIR/requirements.txt" \
-  || "$APP_DIR/venv/bin/pip" install --disable-pip-version-check -q -r "$APP_DIR/requirements.txt" \
-  || die "Не удалось установить библиотеки Python."
+PIP=("$APP_DIR/venv/bin/pip" install --disable-pip-version-check -q -r "$APP_DIR/requirements.txt")
+# сначала из папки wheels (есть в полном архиве, работает без интернета), затем из PyPI
+if ! { [[ -d "$APP_DIR/wheels" ]] && "${PIP[@]}" --no-index --find-links "$APP_DIR/wheels"; }; then
+  "${PIP[@]}" || die "Не удалось установить библиотеки Python. Проверьте доступ сервера к pypi.org."
+fi
 chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 chmod 600 "$APP_DIR/.env"
 
@@ -157,6 +164,20 @@ ExecStart=$APP_DIR/venv/bin/python -m bot.main
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Ограничения: бот может писать только в папку data (база), остальная система только для чтения
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=$APP_DIR/data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target
