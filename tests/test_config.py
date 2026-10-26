@@ -52,8 +52,8 @@ def test_profile_texts_fit_telegram_limits(sample_pdf):
     cfg = Config()
     cfg.seller_name, cfg.seller_inn = "Малютин Максим", "701760448883"
     description, short = profile_texts(cfg)
-    assert "Малютин Максим" in description and "ИНН 701760448883" in description and "890 ₽" in description
-    assert "ИНН 701760448883" in short and "890 ₽" in short
+    assert "Малютин Максим" in description and "ИНН 701760448883" in description and "990 ₽" in description
+    assert "ИНН 701760448883" in short and "990 ₽" in short
     assert len(description) <= 512 and len(short) <= 120
 
 

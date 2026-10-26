@@ -120,7 +120,7 @@ async def app(tmp_path, sample_pdf, monkeypatch):
     handlers.router._parent_router = None
 
 
-async def post_notification(http, base, order, secret=SECRET, total="890.00"):
+async def post_notification(http, base, order, secret=SECRET, total="990.00"):
     data = notification(order, total=total)
     return await http.post(f"{base}/pay/notify", data=form_body(data),
                            headers={"Content-Type": "application/x-www-form-urlencoded", "Sign": sign(data, secret)})
@@ -135,7 +135,7 @@ async def buy(tg: FakeTelegram) -> str:
     pay = [d for d in tg.sent("sendMessage") if "payform.ru" in json.dumps(d.get("reply_markup") or {})][-1]
     markup = pay["reply_markup"] if isinstance(pay["reply_markup"], dict) else json.loads(pay["reply_markup"])
     q = {k: v[0] for k, v in parse_qs(urlparse(markup["inline_keyboard"][0][0]["url"]).query).items()}
-    assert q["do"] == "pay" and q["products[0][price]"] == "890.00"
+    assert q["do"] == "pay" and q["products[0][price]"] == "990.00"
     return q["order_id"]
 
 

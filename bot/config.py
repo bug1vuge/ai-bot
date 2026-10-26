@@ -62,7 +62,7 @@ class Config:
     test_mode: bool = field(default_factory=lambda: _bool("PAYMENTS_TEST_MODE", False))
 
     # ---- товар ----
-    price_rub: int = field(default_factory=lambda: _int("PRICE_RUB", 890, minimum=1))
+    price_rub: int = field(default_factory=lambda: _int("PRICE_RUB", 990, minimum=1))
     product_title: str = field(default_factory=lambda: _env("PRODUCT_TITLE", "Гайд «ИИ без тёмного леса»"))
     payment_description: str = field(default_factory=lambda: _env("PAYMENT_DESCRIPTION", "Гайд ИИ без тёмного леса, PDF"))
     product_file: Path = field(default_factory=lambda: BASE_DIR / _env("PRODUCT_FILE", "data/guide.pdf"))
