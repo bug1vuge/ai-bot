@@ -9,6 +9,7 @@ import html
 import logging
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 
 from aiohttp import web
 
@@ -65,9 +66,16 @@ def make_app(shop: Shop) -> web.Application:
     async def notify(request: web.Request) -> web.Response:
         if not shop.cfg.payments_enabled:
             return web.Response(status=503, text="payments disabled")
-        body = await request.read()  # размер ограничен client_max_size
+        content_type = request.content_type
+        if content_type.startswith("multipart/"):
+            # та же форма, но закодированная как multipart — приводим к обычному виду
+            form = await request.post()
+            body = urlencode([(k, v) for k, v in form.items() if isinstance(v, str)]).encode()
+            content_type = "application/x-www-form-urlencoded"
+        else:
+            body = await request.read()  # размер ограничен client_max_size
         try:
-            data = shop.pay.parse_notification(body, request.content_type, request.headers.get("Sign", ""))
+            data = shop.pay.parse_notification(body, content_type, request.headers.get("Sign", ""))
         except (ProdamusError, UnicodeDecodeError) as e:
             log.warning("Отклонено уведомление от %s: %s", request.remote, e)
             keep_rejected(body, str(e))

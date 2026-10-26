@@ -46,7 +46,7 @@ def test_parse_notification():
     p = Prodamus("https://aibezlesa.payform.ru", KEY)
     data = p.parse_notification(BODY.encode(), "application/x-www-form-urlencoded", PHP_SIGN_DEFAULT)
     f = notification_fields(data)
-    assert f == {"order": "1793005224-111", "prodamus_order": "31337", "sum": "890.00", "status": "success",
+    assert f == {"order": "1793005224-111", "prodamus_order": "31337", "sum": "890.00", "commission_sum": "31.15", "status": "success",
                  "status_text": "Успешная оплата"}
     for body, sign_, err in [(b"", PHP_SIGN_DEFAULT, "пустое"), (BODY.encode(), "", "нет заголовка"),
                              (BODY.encode(), "ab" * 32, "неверная подпись"), (b"{x", "a", "не JSON")]:

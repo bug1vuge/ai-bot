@@ -160,6 +160,7 @@ def notification_fields(data: dict) -> dict:
         "order": str(src.get("order_num") or "").strip(),
         "prodamus_order": str(src.get("order_id") or "").strip(),
         "sum": str(src.get("sum") or "").strip(),
+        "commission_sum": str(src.get("commission_sum") or "").strip(),
         "status": str(src.get("payment_status") or "").strip().lower(),
         "status_text": str(src.get("payment_status_description") or "").strip(),
     }

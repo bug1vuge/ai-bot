@@ -50,6 +50,19 @@ def _same_amount(a, b) -> bool:
     return x is not None and x == y
 
 
+def _paid_enough(paid_sum, commission_sum, expected) -> bool:
+    """Оплачено не меньше цены заказа. Если Prodamus прислал сумму за вычетом своей комиссии,
+    учитываем комиссию. Недоплату (например, покупатель исправил цену в ссылке) не принимаем."""
+    paid, fee, need = _amount(paid_sum), _amount(commission_sum) or Decimal(0), _amount(expected)
+    if paid is None or need is None:
+        return False
+    return paid >= need or paid + fee >= need
+
+
+# Номера заказов бота начинаются не меньше этого числа (Unix-время, см. Database.next_inv_id)
+MIN_ORDER_NUMBER = 1_700_000_000
+
+
 class Shop:
     def __init__(self, config: Config, db: Database, pay: Prodamus, bot: Bot):
         self.cfg = config
@@ -84,8 +97,13 @@ class Shop:
 
     @staticmethod
     def user_from_order(order_id: str) -> int | None:
+        """Покупатель из номера заказа бота «<номер>-<telegram id>»; None — заказ не от бота."""
         parts = order_id.split("-")
-        return int(parts[1]) if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit() else None
+        if len(parts) != 2 or not (parts[0].isdigit() and parts[1].isdigit()):
+            return None
+        if int(parts[0]) < MIN_ORDER_NUMBER or not 0 < int(parts[1]) < 10 ** 15:
+            return None
+        return int(parts[1])
 
     def _payment_url(self, order_id: str, user_id: int) -> str:
         base = self.cfg.public_url
@@ -133,15 +151,14 @@ class Shop:
                         reason=f"заказа нет в базе (заказ в Prodamus {html.escape(f['prodamus_order'])}, "
                                f"сумма {html.escape(f['sum'])})"))
                     return True  # повтор уведомления ничего не изменит — разбирается администратор
-                # Заказа нет в базе (например, база потерялась при переезде) — восстанавливаем.
-                # Сумма подписана Prodamus, поэтому берём её из уведомления.
-                amount = _amount(f["sum"])
-                await self.db.add_payment(order, user, f"{amount or self.cfg.price_str}", "pending", None,
+                # Заказа нет в базе (например, база потерялась при переезде) — восстанавливаем
+                # с текущей ценой; сумма из подписанного уведомления сверяется с ней ниже.
+                await self.db.add_payment(order, user, self.cfg.price_str, "pending", None,
                                           is_test=self.cfg.test_mode)
                 await self.db.ensure_inv_id_above(int(order.split("-")[0]))
                 row = await self.db.get_payment(order)
                 log.warning("Заказ %s восстановлен из уведомления для %s", order, user)
-            if not _same_amount(f["sum"], row["amount"]):
+            if not _paid_enough(f["sum"], f["commission_sum"], row["amount"]):
                 log.error("Заказ %s: оплачено %s вместо %s", order, f["sum"], row["amount"])
                 await self._notify_admins(texts.ADMIN_RESULT_REJECTED.format(
                     payment_id=html.escape(order),

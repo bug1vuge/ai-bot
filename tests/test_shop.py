@@ -185,11 +185,12 @@ async def test_unsuccessful_status_is_ignored(shop):
 
 async def test_lost_order_is_restored_from_notification(shop):
     """Заказа нет в базе (потерялась при переезде) — оплата всё равно не пропадает."""
-    order = f"5000-{USER}"
+    number = int(time.time()) + 10_000
+    order = f"{number}-{USER}"
     assert await paid(shop, notification(order))
     assert len(shop.bot.documents) == 1
     nxt, _ = await shop.get_or_create_payment(333)
-    assert int(nxt.split("-")[0]) > 5000
+    assert int(nxt.split("-")[0]) > number
 
 
 async def test_unknown_order_without_buyer_alerts_admin(shop):
@@ -494,3 +495,42 @@ async def test_offer_page(shop):
         r = await client.get("/offer")
         assert r.status == 200 and "text/html" in r.headers["Content-Type"] and "Публичная оферта" in await r.text()
         assert r.headers["X-Content-Type-Options"] == "nosniff" and "default-src 'none'" in r.headers["Content-Security-Policy"]
+
+
+# ---------- сумма, комиссия, посторонние заказы, multipart ----------
+async def test_amount_rules(shop):
+    from bot.service import _paid_enough
+    assert _paid_enough("890.00", "", "890.00") and _paid_enough("921.15", "31.15", "890.00")   # комиссия на покупателе
+    assert _paid_enough("858.85", "31.15", "890.00")                                            # сумма без комиссии
+    assert not _paid_enough("1.00", "0.04", "890.00") and not _paid_enough("", "", "890.00")
+    assert not _paid_enough("800.00", "31.15", "890.00")
+
+
+async def test_notification_with_commission_is_accepted(shop):
+    pid, _ = await shop.get_or_create_payment(USER)
+    data = {**notification(pid), "sum": "858.85", "commission_sum": "31.15"}
+    assert await paid(shop, data)
+    assert len(shop.bot.documents) == 1
+
+
+async def test_foreign_order_on_same_payform_is_not_restored(shop):
+    """Заказ не от бота (оплачен на той же платёжной странице) не выдаёт гайд «по совпадению»."""
+    assert Shop.user_from_order("12-111") is None and Shop.user_from_order("1793005224-111") == 111
+    assert await paid(shop, notification("12-111"))
+    assert shop.bot.documents == [] and any("заказа нет в базе" in t for t in admin_texts(shop))
+
+
+async def test_multipart_notification(shop):
+    from aiohttp import FormData
+    pid, _ = await shop.get_or_create_payment(USER)
+    data = notification(pid)
+    form = FormData()
+    for k, v in [kv.split("=", 1) for kv in form_body(data).split("&")]:
+        from urllib.parse import unquote_plus
+        form.add_field(unquote_plus(k), unquote_plus(v))
+    form._is_multipart = True
+    async with TestClient(TestServer(make_app(shop))) as client:
+        r = await client.post("/pay/notify", data=form, headers={"Sign": sign(data, SECRET)})
+        assert r.status == 200, await r.text()
+    await shop.wait_background()
+    assert len(shop.bot.documents) == 1
