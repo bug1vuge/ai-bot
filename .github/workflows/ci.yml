@@ -28,7 +28,15 @@ jobs:
       - name: Lint
         run: ruff check .
       - name: Tests
-        run: python -m pytest -q
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -q -rfE --tb=short 2>&1 | tee pytest.log
+          status=${PIPESTATUS[0]}
+          # упавшие тесты — аннотациями, чтобы их было видно без скачивания журнала
+          grep -E "^(FAILED|ERROR) " pytest.log | sed 's/^/::error title=pytest::/'
+          grep -E "^E  " pytest.log | head -20 | sed 's/^/::error title=detail::/'
+          exit $status
 
   shellcheck:
     runs-on: ubuntu-latest
