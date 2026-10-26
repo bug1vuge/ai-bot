@@ -77,6 +77,9 @@ def make_app(shop: Shop) -> web.Application:
         return web.Response(text=render_offer(shop.cfg, shop.bot_username), content_type="text/html")
 
     async def health(_: web.Request) -> web.Response:
+        # 503, если база недоступна — так мониторинг заметит проблему раньше покупателей
+        if not await shop.db.ping():
+            return web.Response(status=503, text="database unavailable")
         return web.Response(text="ok")
 
     # уведомления Робокассы — несколько сотен байт; большие тела отклоняем сразу
