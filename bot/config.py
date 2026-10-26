@@ -6,7 +6,12 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-load_dotenv(BASE_DIR / ".env")
+# interpolate=False: пароли с «$» (например, «a$b» или «${x}») читаются как есть
+load_dotenv(BASE_DIR / ".env", interpolate=False)
+
+
+class ConfigError(SystemExit):
+    """Понятная ошибка настройки вместо трассировки Python."""
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -16,9 +21,26 @@ def _bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on", "да"}
 
 
+def _int(name: str, default: int, minimum: int | None = None) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ConfigError(f"{name} в .env должно быть целым числом, сейчас: «{raw}»") from None
+    if minimum is not None and value < minimum:
+        raise ConfigError(f"{name} в .env должно быть не меньше {minimum}, сейчас: {value}")
+    return value
+
+
 def _int_list(name: str) -> list[int]:
     raw = os.getenv(name, "")
-    return [int(x) for x in raw.replace(" ", "").split(",") if x]
+    items = [x for x in raw.replace(" ", "").split(",") if x]
+    bad = [x for x in items if not x.lstrip("-").isdigit()]
+    if bad:
+        raise ConfigError(f"{name} в .env — числовые Telegram ID через запятую, непонятно: {', '.join(bad)}")
+    return [int(x) for x in items]
 
 
 def _env(name: str, default: str = "") -> str:
@@ -39,7 +61,7 @@ class Config:
     receipt_item_name: str = field(default_factory=lambda: _env("RECEIPT_ITEM_NAME", "Электронное руководство ИИ без тёмного леса, PDF"))
 
     # ---- товар ----
-    price_rub: int = field(default_factory=lambda: int(_env("PRICE_RUB", "890")))
+    price_rub: int = field(default_factory=lambda: _int("PRICE_RUB", 890, minimum=1))
     product_title: str = field(default_factory=lambda: _env("PRODUCT_TITLE", "Гайд «ИИ без тёмного леса»"))
     payment_description: str = field(default_factory=lambda: _env("PAYMENT_DESCRIPTION", "Гайд ИИ без тёмного леса, PDF"))
     product_file: Path = field(default_factory=lambda: BASE_DIR / _env("PRODUCT_FILE", "data/guide.pdf"))
@@ -59,7 +81,7 @@ class Config:
     # ---- веб-сервер для уведомлений Робокассы ----
     web_enabled: bool = field(default_factory=lambda: _bool("WEB_ENABLED", True))
     web_host: str = field(default_factory=lambda: _env("WEB_HOST", "127.0.0.1"))
-    web_port: int = field(default_factory=lambda: int(_env("WEB_PORT", "8080")))
+    web_port: int = field(default_factory=lambda: _int("WEB_PORT", 8080, minimum=1))
     public_url: str = field(default_factory=lambda: _env("PUBLIC_URL").rstrip("/"))
 
     # ---- связь с Telegram ----
@@ -67,8 +89,8 @@ class Config:
     telegram_proxy: str = field(default_factory=lambda: _env("TELEGRAM_PROXY"))
 
     # ---- техническое ----
-    poll_interval_sec: int = field(default_factory=lambda: int(_env("POLL_INTERVAL_SEC", "30")))
-    payment_ttl_min: int = field(default_factory=lambda: int(_env("PAYMENT_TTL_MIN", "60")))
+    poll_interval_sec: int = field(default_factory=lambda: _int("POLL_INTERVAL_SEC", 30, minimum=5))
+    payment_ttl_min: int = field(default_factory=lambda: _int("PAYMENT_TTL_MIN", 60, minimum=5))
     db_path: Path = field(default_factory=lambda: BASE_DIR / _env("DB_PATH", "data/bot.db"))
 
     def __post_init__(self) -> None:
@@ -85,15 +107,19 @@ class Config:
 
     def validate(self) -> None:
         if not self.bot_token:
-            raise SystemExit("Не заполнен BOT_TOKEN в файле .env")
+            raise ConfigError("Не заполнен BOT_TOKEN в файле .env")
         filled = [bool(self.rk_login), bool(self.rk_password1), bool(self.rk_password2)]
         if any(filled) and not all(filled):
-            raise SystemExit("Заполните все три поля Робокассы (ROBOKASSA_LOGIN, ROBOKASSA_PASSWORD1, "
+            raise ConfigError("Заполните все три поля Робокассы (ROBOKASSA_LOGIN, ROBOKASSA_PASSWORD1, "
                              "ROBOKASSA_PASSWORD2) или оставьте все пустыми")
         if self.rk_hash not in {"md5", "sha1", "sha256", "sha384", "sha512"}:
-            raise SystemExit("ROBOKASSA_HASH должен быть одним из: md5, sha1, sha256, sha384, sha512")
+            raise ConfigError("ROBOKASSA_HASH должен быть одним из: md5, sha1, sha256, sha384, sha512")
+        if not 1 <= self.web_port <= 65535:
+            raise ConfigError(f"WEB_PORT должен быть от 1 до 65535, сейчас: {self.web_port}")
+        if self.public_url and not self.public_url.startswith("https://"):
+            raise ConfigError("PUBLIC_URL должен начинаться с https:// — Робокасса работает только с HTTPS")
         if not self.product_file.exists():
-            raise SystemExit(f"Не найден файл продукта: {self.product_file}. Положите PDF в папку data/.")
+            raise ConfigError(f"Не найден файл продукта: {self.product_file}. Положите PDF в папку data/.")
 
     @property
     def price_str(self) -> str:
