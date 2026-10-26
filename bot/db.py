@@ -7,6 +7,7 @@
 import asyncio
 import contextlib
 import logging
+import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -84,6 +85,9 @@ class Database:
         self._lock = asyncio.Lock()
 
     async def connect(self) -> None:
+        if sqlite3.sqlite_version_info < (3, 35):
+            raise RuntimeError(f"Нужен SQLite 3.35 или новее, установлен {sqlite3.sqlite_version}. "
+                               "Используйте Ubuntu 22.04+, Debian 12+ или Python 3.12+ на Windows.")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = await aiosqlite.connect(self.path, isolation_level=None)
         self.conn.row_factory = aiosqlite.Row

@@ -163,6 +163,8 @@ WorkingDirectory=$APP_DIR
 ExecStart=$APP_DIR/venv/bin/python -m bot.main
 Restart=always
 RestartSec=5
+# время закончить начатые выдачи при остановке
+TimeoutStopSec=30
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 # Ограничения: бот может писать только в папку data (база), остальная система только для чтения
