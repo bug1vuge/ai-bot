@@ -73,6 +73,13 @@ async def shop(tmp_path, sample_pdf):
     await db.close()
 
 
+async def paid(shop, data):
+    """Уведомление Робокассы + ожидание фоновой выдачи гайда."""
+    ok = await shop.handle_result(data)
+    await shop.wait_background()
+    return ok
+
+
 def result_params(inv_id, out_sum="890.000000", user=USER, password=P2):
     return {"OutSum": out_sum, "InvId": str(inv_id), "Shp_user": str(user),
             "SignatureValue": md5(f"{out_sum}:{inv_id}:{password}:Shp_user={user}").upper()}
@@ -135,7 +142,8 @@ async def test_result_delivers_exactly_once(shop):
     data = result_params(pid)
     results = await asyncio.gather(*[shop.handle_result(data) for _ in range(5)],
                                    *[shop.process_payment(pid) for _ in range(3)])
-    assert all(r in (True, "succeeded", "pending", "already_delivered") for r in results)
+    await shop.wait_background()
+    assert all(r in (True, "succeeded", "pending", "already_delivered", "in_progress") for r in results)
     assert len(shop.bot.documents) == 1
     assert await shop.db.has_paid(USER)
     sale = [m for m in shop.bot.messages if m[0] == 999]
@@ -144,19 +152,19 @@ async def test_result_delivers_exactly_once(shop):
 
 async def test_result_wrong_amount_rejected(shop):
     pid, _ = await shop.get_or_create_payment(USER)
-    assert not await shop.handle_result(result_params(pid, out_sum="1.00"))
+    assert not await paid(shop, result_params(pid, out_sum="1.00"))
     assert shop.bot.documents == [] and not await shop.db.has_paid(USER)
 
 
 async def test_result_wrong_user_rejected(shop):
     pid, _ = await shop.get_or_create_payment(USER)
-    assert not await shop.handle_result(result_params(pid, user=555))
+    assert not await paid(shop, result_params(pid, user=555))
     assert shop.bot.documents == []
 
 
 async def test_result_restores_lost_invoice(shop):
     """Счёта нет в базе (потерялась при переезде) — оплата всё равно не пропадает."""
-    assert await shop.handle_result(result_params(5000))
+    assert await paid(shop, result_params(5000))
     assert len(shop.bot.documents) == 1
     nxt, _ = await shop.get_or_create_payment(333)
     assert int(nxt) > 5000  # номер не повторится
@@ -165,7 +173,7 @@ async def test_result_restores_lost_invoice(shop):
 async def test_failed_delivery_is_retried(shop):
     shop.bot.fail_documents = 1
     pid, _ = await shop.get_or_create_payment(USER)
-    assert await shop.handle_result(result_params(pid))
+    assert await paid(shop, result_params(pid))
     assert shop.bot.documents == [] and any(m[0] == 999 for m in shop.bot.messages)
     assert await shop.process_payment(pid) == "succeeded"   # кнопка «проверить» или фоновая проверка
     assert len(shop.bot.documents) == 1
@@ -193,7 +201,7 @@ async def test_op_state_wrong_sum_and_cancel(shop):
 # ---------- водяной знак, выдача вручную ----------
 async def test_watermark_keeps_pages_and_bookmarks(shop):
     pid, _ = await shop.get_or_create_payment(USER)
-    await shop.handle_result(result_params(pid))
+    await paid(shop, result_params(pid))
     stamped = PdfReader(io.BytesIO(shop.bot.documents[0][1].data))
     original = PdfReader(str(shop.cfg.product_file))
     assert len(stamped.pages) == len(original.pages)
@@ -218,6 +226,7 @@ async def test_web_endpoints(shop):
         assert ok.status == 200 and await ok.text() == f"OK{pid}"
         again = await client.post("/robokassa/result", data=result_params(pid))
         assert again.status == 200
+        await shop.wait_background()
         got = await client.get("/robokassa/result", params=result_params(pid))  # если в кабинете выбран GET
         assert got.status == 200
         succ = await client.get("/robokassa/success?OutSum=890&InvId=1", allow_redirects=False)
@@ -297,10 +306,11 @@ async def test_double_click_creates_one_invoice(shop):
 
 
 # ---------- повторная выдача ----------
-async def test_undelivered_payment_is_retried_by_poller(shop):
+async def test_undelivered_payment_is_retried_by_poller(shop, monkeypatch):
+    monkeypatch.setattr("bot.service.retry_delay", lambda attempts: 0)
     shop.bot.fail_documents = 2
     pid, _ = await shop.get_or_create_payment(USER)
-    assert await shop.handle_result(result_params(pid))
+    assert await paid(shop, result_params(pid))
     assert shop.bot.documents == []
     await shop.poll_once()                 # вторая неудача
     assert shop.bot.documents == []
@@ -315,11 +325,12 @@ async def test_undelivered_payment_is_retried_by_poller(shop):
     assert len(shop.bot.documents) == 1
 
 
-async def test_delivery_gives_up_after_max_attempts(shop):
+async def test_delivery_gives_up_after_max_attempts(shop, monkeypatch):
+    monkeypatch.setattr("bot.service.retry_delay", lambda attempts: 0)
     from bot.service import MAX_DELIVERY_ATTEMPTS
     shop.bot.fail_documents = 10 ** 6
     pid, _ = await shop.get_or_create_payment(USER)
-    await shop.handle_result(result_params(pid))
+    await paid(shop, result_params(pid))
     for _ in range(MAX_DELIVERY_ATTEMPTS + 3):
         await shop.poll_once()
     row = await shop.db.get_payment(pid)
@@ -330,7 +341,7 @@ async def test_delivery_gives_up_after_max_attempts(shop):
 
 async def test_check_after_delivery_reports_already_delivered(shop):
     pid, _ = await shop.get_or_create_payment(USER)
-    await shop.handle_result(result_params(pid))
+    await paid(shop, result_params(pid))
     assert await shop.process_payment(pid) == "already_delivered"
     assert len(shop.bot.documents) == 1
 
@@ -349,12 +360,12 @@ async def test_watermarked_copy_is_built_once(shop, monkeypatch):
 # ---------- статистика ----------
 async def test_test_payments_not_counted_as_revenue(shop):
     pid, _ = await shop.get_or_create_payment(USER)
-    await shop.handle_result(result_params(pid))
+    await paid(shop, result_params(pid))
     s = await shop.db.stats()
     assert s["sales"] == 0 and s["revenue"] == 0 and s["test_sales"] == 1
     shop.cfg.rk_test = shop.kassa.is_test = False
     pid2, _ = await shop.get_or_create_payment(222)
-    await shop.handle_result(result_params(pid2, user=222))
+    await paid(shop, result_params(pid2, user=222))
     s = await shop.db.stats()
     assert s["sales"] == 1 and s["revenue"] == 890
 
@@ -379,3 +390,204 @@ async def test_old_database_is_migrated(tmp_path):
         assert (await db.stats())["sales"] == 1
     finally:
         await db.close()
+
+
+# ---------- второй аудит: надёжность пути «оплата → гайд» ----------
+async def test_many_buyers_at_once_get_unique_invoices(shop):
+    """Раньше параллельные покупки разных пользователей получали один номер счёта."""
+    for uid in range(1, 51):
+        await shop.db.upsert_user(uid, None, "U", None)
+    results = await asyncio.gather(*[shop.get_or_create_payment(uid) for uid in range(1, 51)])
+    assert len({pid for pid, _ in results}) == 50
+
+
+async def test_result_is_acknowledged_without_waiting_for_telegram(shop):
+    """Медленный Telegram не задерживает ответ Робокассе: оплата фиксируется сразу, гайд — в фоне."""
+    import time
+    slow = shop.bot.send_document
+
+    async def slow_send(*a, **kw):
+        await asyncio.sleep(3)
+        return await slow(*a, **kw)
+    shop.bot.send_document = slow_send
+    pid, _ = await shop.get_or_create_payment(USER)
+    t = time.monotonic()
+    assert await shop.handle_result(result_params(pid))
+    assert time.monotonic() - t < 1
+    assert (await shop.db.get_payment(pid))["status"] == "succeeded"
+    assert await shop.process_payment(pid) == "in_progress"
+    await shop.wait_background()
+    assert len(shop.bot.documents) == 1
+
+
+async def test_restart_during_sending_is_redelivered(shop, tmp_path):
+    """Бот перезапустился посреди отправки — гайд не теряется."""
+    from bot.db import SENDING
+    pid, _ = await shop.get_or_create_payment(USER)
+    await shop.db.mark_paid(pid)
+    await shop.db._write("UPDATE payments SET delivered=? WHERE payment_id=?", (SENDING, pid))
+    await shop.db.close()
+    await shop.db.connect()                      # запуск после сбоя
+    await shop.poll_once()
+    assert len(shop.bot.documents) == 1
+    assert (await shop.db.get_payment(pid))["delivered"] == 1
+
+
+async def test_retry_waits_for_backoff(shop, monkeypatch):
+    from datetime import timedelta
+
+    import bot.db as dbmod
+    shop.bot.fail_documents = 1
+    pid, _ = await shop.get_or_create_payment(USER)
+    await paid(shop, result_params(pid))
+    await shop.poll_once()
+    assert shop.bot.documents == []              # пауза ещё не прошла
+    later = dbmod.now() + timedelta(seconds=20)
+    monkeypatch.setattr(dbmod, "now", lambda: later)
+    await shop.poll_once()
+    assert len(shop.bot.documents) == 1
+
+
+async def test_user_returning_gets_guide_even_after_attempts_exhausted(shop, monkeypatch):
+    """Пользователь заблокировал бота, попытки кончились, потом он вернулся — гайд приходит сразу."""
+    from bot.service import MAX_DELIVERY_ATTEMPTS
+    monkeypatch.setattr("bot.service.retry_delay", lambda attempts: 0)
+    shop.bot.fail_documents = 10 ** 6
+    pid, _ = await shop.get_or_create_payment(USER)
+    await paid(shop, result_params(pid))
+    for _ in range(MAX_DELIVERY_ATTEMPTS):
+        await shop.poll_once()
+    shop.bot.fail_documents = 0
+    await shop.poll_once()
+    assert shop.bot.documents == []
+    assert await shop.deliver_pending_for_user(USER)
+    assert len(shop.bot.documents) == 1
+
+
+async def test_late_payment_is_found_by_poller(shop):
+    """Покупатель оплатил старую ссылку (позже TTL), а уведомление не дошло."""
+    from datetime import timedelta
+
+    import bot.db as dbmod
+    pid, _ = await shop.get_or_create_payment(USER)
+    old = dbmod.iso(dbmod.now() - timedelta(hours=3))
+    await shop.db._write("UPDATE payments SET created_at=? WHERE payment_id=?", (old, pid))
+    shop.kassa.states[pid] = {"result": 0, "state": 100, "out_sum": "890.00"}
+    calls = []
+    real = shop.kassa.op_state
+
+    async def counting(inv):
+        calls.append(inv)
+        return await real(inv)
+    shop.kassa.op_state = counting
+    await shop.poll_once()
+    assert len(shop.bot.documents) == 1 and calls == [pid]
+
+
+async def test_old_unpaid_invoice_is_checked_rarely(shop):
+    from datetime import timedelta
+
+    import bot.db as dbmod
+    pid, _ = await shop.get_or_create_payment(USER)
+    await shop.db._write("UPDATE payments SET created_at=? WHERE payment_id=?",
+                         (dbmod.iso(dbmod.now() - timedelta(hours=3)), pid))
+    calls = []
+
+    async def counting(inv):
+        calls.append(inv)
+        return {"result": 3, "state": None, "out_sum": None}
+    shop.kassa.op_state = counting
+    for _ in range(5):
+        await shop.poll_once()
+    assert calls == [pid]                        # не чаще раза в 10 минут
+    await shop.db._write("UPDATE payments SET created_at=?, checked_at=NULL WHERE payment_id=?",
+                         (dbmod.iso(dbmod.now() - timedelta(hours=30)), pid))
+    await shop.poll_once()
+    assert calls == [pid]                        # старше суток — не проверяется
+
+
+async def test_paid_after_cancel_is_delivered(shop):
+    pid, _ = await shop.get_or_create_payment(USER)
+    shop.kassa.states[pid] = {"result": 0, "state": 10, "out_sum": None}
+    assert await shop.process_payment(pid) == "canceled"
+    assert await paid(shop, result_params(pid))
+    assert len(shop.bot.documents) == 1
+    await shop.db.mark_canceled(pid)             # оплаченный счёт отменить нельзя
+    assert (await shop.db.get_payment(pid))["status"] == "succeeded"
+
+
+async def test_repeat_payment_alerts_admin(shop):
+    pid1, _ = await shop.get_or_create_payment(USER)
+    await paid(shop, result_params(pid1))
+    await shop.db._write("UPDATE payments SET created_at='2000-01-01' WHERE payment_id=?", (pid1,))
+    pid2 = str(int(pid1) + 100)
+    await paid(shop, result_params(pid2))        # оплатил вторую, старую ссылку
+    assert len(shop.bot.documents) == 2
+    assert any("повторно" in m[1] for m in shop.bot.messages if m[0] == USER)
+    assert any("Повторная оплата" in m[1] for m in shop.bot.messages if m[0] == 999)
+
+
+async def test_rejected_signed_notification_alerts_admin(shop):
+    pid, _ = await shop.get_or_create_payment(USER)
+    assert not await paid(shop, result_params(pid, out_sum="1.000000"))
+    assert any("отклонил" in m[1] for m in shop.bot.messages if m[0] == 999)
+
+
+async def test_amount_formats_are_equal(shop):
+    from bot.service import _same_amount
+    assert _same_amount("890", "890.00") and _same_amount("890.000000", "890.00")
+    assert not _same_amount("889.99", "890.00") and not _same_amount("abc", "890.00") and not _same_amount(None, "1")
+
+
+async def test_watermark_failure_still_delivers(shop, monkeypatch):
+    def broken(*a):
+        raise RuntimeError("no font")
+    monkeypatch.setattr("bot.service.stamp_pdf", broken)
+    pid, _ = await shop.get_or_create_payment(USER)
+    await paid(shop, result_params(pid))
+    assert len(shop.bot.documents) == 1
+    assert shop.bot.documents[0][1].data == shop.cfg.product_file.read_bytes()
+    assert any("водяной знак" in m[1] for m in shop.bot.messages if m[0] == 999)
+
+
+async def test_stale_file_id_is_rebuilt(shop):
+    await shop.send_product(USER)
+    real = shop.bot.send_document
+
+    async def picky(chat_id, document, **kw):
+        if document == "FILEID":
+            raise RuntimeError("Bad Request: wrong file identifier/HTTP URL specified")
+        return await real(chat_id, document, **kw)
+    shop.bot.send_document = picky
+    await shop.send_product(USER)
+    assert len(shop.bot.documents) == 2
+
+
+async def test_network_error_on_cached_file_is_not_hidden(shop):
+    await shop.send_product(USER)
+
+    async def down(*a, **kw):
+        raise RuntimeError("Forbidden: bot was blocked by the user")
+    shop.bot.send_document = down
+    with pytest.raises(RuntimeError):
+        await shop.send_product(USER)
+
+
+async def test_daily_backup(shop):
+    await shop.poll_once()
+    folder = shop.cfg.db_path.parent / "backups"
+    files = list(folder.glob("bot-*.db"))
+    assert len(files) == 1 and files[0].stat().st_size > 0
+    for i in range(20):
+        (folder / f"bot-2000-01-{i + 1:02d}.db").write_bytes(b"x")
+    shop._last_backup = None
+    await shop.poll_once()
+    assert len(list(folder.glob("bot-*.db"))) == 14
+
+
+async def test_grant_reports_failure(shop, monkeypatch):
+    monkeypatch.setattr("bot.service.retry_delay", lambda attempts: 0)
+    shop.bot.fail_documents = 1
+    assert await shop.grant(222) == "delivery_failed"
+    await shop.poll_once()
+    assert len(shop.bot.documents) == 1

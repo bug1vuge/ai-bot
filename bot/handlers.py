@@ -148,8 +148,8 @@ async def _check_and_reply(bot: Bot, shop: Shop, user_id: int, payment_id: str):
         log.exception("Ошибка проверки платежа %s", payment_id)
         await _send(bot, user_id, texts.CHECK_ERROR)
         return
-    if status == "succeeded":
-        return  # благодарность и файл только что отправлены
+    if status in {"succeeded", "in_progress"}:
+        return  # благодарность и файл уже отправлены или отправляются прямо сейчас
     if status == "already_delivered":
         await _send(bot, user_id, texts.PAID_ALREADY_SENT, reply_markup=main_kb(shop, True))
     elif status == "delivery_failed":
@@ -250,11 +250,12 @@ async def grant(message: Message, command: CommandObject, shop: Shop):
         await message.answer(f"Пользователь {user_id} ещё не запускал бота — Telegram не даст отправить ему файл. "
                              "Попросите его нажать /start и повторите команду.")
         return
-    try:
-        await shop.grant(user_id)
+    status = await shop.grant(user_id)
+    if status == "succeeded":
         await message.answer(f"Гайд выдан пользователю {user_id} ✅")
-    except Exception as e:
-        await message.answer(f"Не получилось отправить: {html.escape(str(e))}")
+    else:
+        await message.answer(f"Пользователю {user_id} не удалось отправить файл (возможно, он заблокировал бота). "
+                             "Бот повторит отправку автоматически и отдаст гайд, когда пользователь откроет бота.")
 
 
 @router.message(Command("check"))

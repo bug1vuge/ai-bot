@@ -154,10 +154,10 @@ def docs_of(session):
 
 
 async def paid_user(shop):
-    from tests.test_shop import result_params
+    from tests.test_shop import paid, result_params
     await shop.db.upsert_user(111, "ivan", "Иван", None)
     pid, _ = await shop.get_or_create_payment(111)
-    await shop.handle_result(result_params(pid))
+    await paid(shop, result_params(pid))
     return pid
 
 
