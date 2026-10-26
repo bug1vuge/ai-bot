@@ -1,7 +1,9 @@
 """Защита от флуда: слишком частые нажатия и сообщения одного пользователя пропускаются.
 Так один человек не может завалить бота запросами и вызвать ограничения Telegram для всех."""
+import contextlib
 import time
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from aiogram import BaseMiddleware
 from aiogram.types import CallbackQuery, TelegramObject
@@ -21,10 +23,8 @@ class ThrottleMiddleware(BaseMiddleware):
         now = time.monotonic()
         if now - self._last.get(user.id, float("-inf")) < self.interval:
             if isinstance(event, CallbackQuery):
-                try:
+                with contextlib.suppress(Exception):
                     await event.answer()  # убираем «часики» на кнопке
-                except Exception:
-                    pass
             return None
         self._last[user.id] = now
         if len(self._last) > self.max_users:

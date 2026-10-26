@@ -40,7 +40,7 @@ async def main() -> None:
             "включите VPN для всего устройства или укажите TELEGRAM_PROXY в .env.", e)
         await bot.session.close()
         await db.close()
-        raise SystemExit(1)
+        raise SystemExit(1) from None
     shop.bot_username = me.username or ""
 
     await bot.set_my_commands([

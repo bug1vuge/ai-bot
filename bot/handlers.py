@@ -1,4 +1,5 @@
 """Обработчики сообщений и кнопок."""
+import contextlib
 import html
 import logging
 import time
@@ -287,13 +288,9 @@ async def on_error(event: ErrorEvent, bot: Bot):
     upd = event.update
     user = (upd.message and upd.message.from_user) or (upd.callback_query and upd.callback_query.from_user)
     if upd.callback_query:
-        try:
+        with contextlib.suppress(Exception):
             await upd.callback_query.answer()
-        except Exception:
-            pass
     if user:
-        try:
+        with contextlib.suppress(Exception):
             await bot.send_message(user.id, texts.GENERIC_ERROR)
-        except Exception:
-            pass
     return True
