@@ -135,11 +135,11 @@ async def test_result_delivers_exactly_once(shop):
     data = result_params(pid)
     results = await asyncio.gather(*[shop.handle_result(data) for _ in range(5)],
                                    *[shop.process_payment(pid) for _ in range(3)])
-    assert all(r in (True, "succeeded", "pending") for r in results)
+    assert all(r in (True, "succeeded", "pending", "already_delivered") for r in results)
     assert len(shop.bot.documents) == 1
     assert await shop.db.has_paid(USER)
     sale = [m for m in shop.bot.messages if m[0] == 999]
-    assert len(sale) == 1 and "тестовый режим" in sale[0][1] and "tiktok" in sale[0][1]
+    assert len(sale) == 1 and "тестовый платёж" in sale[0][1] and "tiktok" in sale[0][1]
 
 
 async def test_result_wrong_amount_rejected(shop):
@@ -258,3 +258,121 @@ def test_config_defaults_offer_and_seller(monkeypatch):
     assert c.seller_info == "Иванов Иван, самозанятый, ИНН 123"
     monkeypatch.setenv("OFFER_URL", "https://telegra.ph/my")
     assert Config().offer_url == "https://telegra.ph/my"
+
+
+# ---------- номера счетов ----------
+async def test_invoice_ids_survive_database_loss(shop, tmp_path, monkeypatch):
+    """После потери базы номера счетов не повторяют старые — иначе проверка статуса
+    могла бы найти чужой оплаченный счёт с тем же номером."""
+    import time
+    pid, _ = await shop.get_or_create_payment(USER)
+    assert int(pid) >= int(time.time()) - 5
+    later = time.time() + 60  # переустановка бота произошла позже
+    monkeypatch.setattr("bot.db.time.time", lambda: later)
+    fresh = Database(tmp_path / "new.db")
+    await fresh.connect()
+    try:
+        assert await fresh.next_inv_id() > int(pid)
+    finally:
+        await fresh.close()
+
+
+async def test_price_change_creates_new_invoice(shop):
+    pid1, url1 = await shop.get_or_create_payment(USER)
+    shop.cfg.price_rub = 990
+    pid2, url2 = await shop.get_or_create_payment(USER)
+    assert pid1 != pid2 and "OutSum=990.00" in url2
+    shop.cfg.rk_test = shop.kassa.is_test = False
+    pid3, url3 = await shop.get_or_create_payment(USER)
+    assert pid3 != pid2 and "IsTest" not in url3
+
+
+async def test_double_click_creates_one_invoice(shop):
+    results = await asyncio.gather(*[shop.get_or_create_payment(USER) for _ in range(5)])
+    assert len({pid for pid, _ in results}) == 1
+    assert shop._locks == {}  # блокировки не копятся
+
+
+# ---------- повторная выдача ----------
+async def test_undelivered_payment_is_retried_by_poller(shop):
+    shop.bot.fail_documents = 2
+    pid, _ = await shop.get_or_create_payment(USER)
+    assert await shop.handle_result(result_params(pid))
+    assert shop.bot.documents == []
+    await shop.poll_once()                 # вторая неудача
+    assert shop.bot.documents == []
+    await shop.poll_once()                 # получилось
+    assert len(shop.bot.documents) == 1
+    thanks = [m for m in shop.bot.messages if m[0] == USER and "Оплата прошла" in m[1]]
+    errors = [m for m in shop.bot.messages if m[0] == USER and "техническ" in m[1]]
+    admin_alerts = [m for m in shop.bot.messages if m[0] == 999 and "Не удалось выдать" in m[1]]
+    assert len(thanks) == 1 and len(errors) == 1 and len(admin_alerts) == 1
+    assert (await shop.db.stats())["undelivered"] == 0
+    await shop.poll_once()
+    assert len(shop.bot.documents) == 1
+
+
+async def test_delivery_gives_up_after_max_attempts(shop):
+    from bot.service import MAX_DELIVERY_ATTEMPTS
+    shop.bot.fail_documents = 10 ** 6
+    pid, _ = await shop.get_or_create_payment(USER)
+    await shop.handle_result(result_params(pid))
+    for _ in range(MAX_DELIVERY_ATTEMPTS + 3):
+        await shop.poll_once()
+    row = await shop.db.get_payment(pid)
+    assert row["delivery_attempts"] == MAX_DELIVERY_ATTEMPTS
+    alerts = [m for m in shop.bot.messages if m[0] == 999 and "Не удалось выдать" in m[1]]
+    assert len(alerts) == 2  # первая неудача и последняя попытка
+
+
+async def test_check_after_delivery_reports_already_delivered(shop):
+    pid, _ = await shop.get_or_create_payment(USER)
+    await shop.handle_result(result_params(pid))
+    assert await shop.process_payment(pid) == "already_delivered"
+    assert len(shop.bot.documents) == 1
+
+
+# ---------- кэш файла ----------
+async def test_watermarked_copy_is_built_once(shop, monkeypatch):
+    import bot.service as service
+    calls = []
+    real = service.stamp_pdf
+    monkeypatch.setattr(service, "stamp_pdf", lambda *a: calls.append(1) or real(*a))
+    for _ in range(3):
+        await shop.send_product(USER)
+    assert len(calls) == 1 and shop.bot.documents[1][1] == "FILEID"
+
+
+# ---------- статистика ----------
+async def test_test_payments_not_counted_as_revenue(shop):
+    pid, _ = await shop.get_or_create_payment(USER)
+    await shop.handle_result(result_params(pid))
+    s = await shop.db.stats()
+    assert s["sales"] == 0 and s["revenue"] == 0 and s["test_sales"] == 1
+    shop.cfg.rk_test = shop.kassa.is_test = False
+    pid2, _ = await shop.get_or_create_payment(222)
+    await shop.handle_result(result_params(pid2, user=222))
+    s = await shop.db.stats()
+    assert s["sales"] == 1 and s["revenue"] == 890
+
+
+async def test_old_database_is_migrated(tmp_path):
+    import aiosqlite
+    path = tmp_path / "old.db"
+    async with aiosqlite.connect(path) as c:
+        await c.executescript("""
+            CREATE TABLE users (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+                                source TEXT, created_at TEXT NOT NULL);
+            CREATE TABLE payments (payment_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, amount TEXT NOT NULL,
+                status TEXT NOT NULL, confirmation_url TEXT, created_at TEXT NOT NULL, paid_at TEXT,
+                delivered INTEGER NOT NULL DEFAULT 0, manual INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO payments VALUES ('1001', 1, '890.00', 'succeeded', NULL, '2026-10-20T00:00:00+00:00',
+                                         '2026-10-20T00:00:00+00:00', 1, 0);""")
+    db = Database(path)
+    await db.connect()
+    try:
+        row = await db.get_payment("1001")
+        assert row["is_test"] == 0 and row["delivery_attempts"] == 0
+        assert (await db.stats())["sales"] == 1
+    finally:
+        await db.close()

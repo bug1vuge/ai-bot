@@ -74,4 +74,8 @@ BTN_SUPPORT = "💬 Поддержка"
 
 # Уведомления администратору
 ADMIN_SALE = "💰 Новая продажа{mode}: {amount} ₽\nПокупатель: {who} (ID <code>{user_id}</code>)\nИсточник: {source}\nСчёт: <code>{payment_id}</code>"
-ADMIN_DELIVERY_FAIL = "⚠️ Не удалось выдать гайд пользователю {user_id} (платёж {payment_id}): {error}"
+ADMIN_DELIVERY_FAIL = (
+    "⚠️ Не удалось выдать гайд пользователю <code>{user_id}</code> (счёт <code>{payment_id}</code>), "
+    "попытка {attempts} из {max_attempts}: {error}\n"
+    "Бот повторяет отправку автоматически. Если попытки закончились — /grant {user_id}"
+)
