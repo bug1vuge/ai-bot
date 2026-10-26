@@ -431,7 +431,9 @@ async def test_daily_backup(shop):
 
 
 # ---------- веб-адреса ----------
-async def test_web_notify_endpoint(shop):
+async def test_web_notify_endpoint(shop, monkeypatch):
+    # свежезагруженный сервер: монотонные часы ещё меньше интервала тревог — первая тревога всё равно уходит
+    monkeypatch.setattr("bot.web.time.monotonic", lambda: 5.0)
     pid, _ = await shop.get_or_create_payment(USER)
     data = notification(pid)
     body = form_body(data)

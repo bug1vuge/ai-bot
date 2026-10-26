@@ -46,7 +46,7 @@ async def security_headers(request: web.Request, handler):
 
 
 def make_app(shop: Shop) -> web.Application:
-    last_alert = {"t": 0.0}
+    last_alert: dict[str, float | None] = {"t": None}  # None — тревог ещё не было
 
     def bot_link(payload: str) -> str:
         return f"https://t.me/{shop.bot_username}?start={payload}" if shop.bot_username else "https://t.me"
@@ -80,7 +80,7 @@ def make_app(shop: Shop) -> web.Application:
             log.warning("Отклонено уведомление от %s: %s", request.remote, e)
             keep_rejected(body, str(e))
             now = time.monotonic()
-            if now - last_alert["t"] > ALERT_EVERY_SEC:
+            if last_alert["t"] is None or now - last_alert["t"] > ALERT_EVERY_SEC:
                 last_alert["t"] = now
                 await shop._notify_admins(texts.ADMIN_BAD_SIGNATURE.format(reason=html.escape(str(e))))
             return web.Response(status=400, text=f"error: {e}")
