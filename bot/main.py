@@ -1,5 +1,6 @@
 """Точка входа: python -m bot.main"""
 import asyncio
+import contextlib
 import logging
 
 from aiogram import Bot, Dispatcher
@@ -69,7 +70,8 @@ async def main() -> None:
 
     if missing_fields(cfg):
         logging.warning("В оферте не заполнены поля: %s — впишите их в .env", ", ".join(missing_fields(cfg)))
-    poller = asyncio.create_task(shop.poll_pending()) if cfg.payments_enabled else None
+    # фоновая проверка нужна всегда: она же повторяет выдачу, если файл не отправился
+    poller = asyncio.create_task(shop.poll_pending())
     logging.info("Бот @%s запущен. Цена %s ₽, водяной знак: %s", shop.bot_username, cfg.price_rub, cfg.watermark)
     if cfg.payments_enabled:
         logging.info("Робокасса: магазин %s, режим %s", cfg.rk_login, "ТЕСТОВЫЙ" if cfg.rk_test else "боевой")
@@ -78,8 +80,9 @@ async def main() -> None:
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
-        if poller:
-            poller.cancel()
+        poller.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await poller
         if runner:
             await runner.cleanup()
         await kassa.close()
