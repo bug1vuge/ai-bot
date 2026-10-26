@@ -12,6 +12,7 @@ from aiohttp import web
 from .config import Config
 from .db import Database
 from .handlers import router
+from .middlewares import ThrottleMiddleware
 from .offer import missing_fields
 from .robokassa import Robokassa
 from .service import Shop
@@ -48,6 +49,9 @@ async def main() -> None:
     ])
 
     dp = Dispatcher()
+    throttle = ThrottleMiddleware()
+    dp.message.outer_middleware(throttle)
+    dp.callback_query.outer_middleware(throttle)
     dp.include_router(router)
     dp["shop"] = shop
 
