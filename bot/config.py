@@ -106,6 +106,15 @@ class Config:
         """Без данных Prodamus бот работает в режиме витрины: всё показывает, но оплату не принимает."""
         return bool(self.pay_url and self.pay_secret and self.public_url)
 
+    @property
+    def showcase_reason(self) -> str:
+        """Почему оплата выключена (пусто — включена)."""
+        if self.payments_enabled:
+            return ""
+        missing = [name for name, value in (("PRODAMUS_URL", self.pay_url), ("PRODAMUS_SECRET", self.pay_secret),
+                                            ("PUBLIC_URL", self.public_url)) if not value]
+        return "не заполнено в .env: " + ", ".join(missing)
+
     def can_buy(self, user_id: int) -> bool:
         """Можно ли этому пользователю выдать ссылку на оплату."""
         if not self.payments_enabled:
@@ -115,12 +124,12 @@ class Config:
     def validate(self) -> None:
         if not self.bot_token:
             raise ConfigError("Не заполнен BOT_TOKEN в файле .env")
-        if bool(self.pay_url) != bool(self.pay_secret):
-            raise ConfigError("Заполните оба поля Prodamus (PRODAMUS_URL и PRODAMUS_SECRET) или оставьте оба пустыми")
-        if self.pay_url and not re.fullmatch(r"https://[a-z0-9.-]+", self.pay_url):
+        # Неполные данные Prodamus — не повод останавливать бота: он работает в режиме витрины,
+        # а причину пишет в журнал и присылает администратору (см. showcase_reason).
+        if self.pay_url and self.pay_secret and not re.fullmatch(r"https://[a-z0-9.-]+", self.pay_url):
             raise ConfigError("PRODAMUS_URL — адрес платёжной страницы вида https://имя.payform.ru, "
                               f"сейчас: «{self.pay_url}»")
-        if self.pay_url and not self.public_url:
+        if self.pay_url and self.pay_secret and not self.public_url:
             raise ConfigError("Для приёма оплаты нужен PUBLIC_URL — адрес бота с https://, на него Prodamus "
                               "присылает уведомления об оплате")
         if not 1 <= self.web_port <= 65535:

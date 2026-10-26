@@ -34,8 +34,8 @@ def test_validate_prodamus_fields(sample_pdf):
     cfg = Config()
     cfg.bot_token, cfg.product_file, cfg.public_url = "1:x", sample_pdf, "https://bot.example.ru"
     cfg.pay_url, cfg.pay_secret = "https://aibezlesa.payform.ru", ""
-    with pytest.raises(ConfigError, match="оба поля"):
-        cfg.validate()
+    cfg.validate()                     # неполные данные — бот запускается в режиме витрины
+    assert not cfg.payments_enabled and cfg.showcase_reason == "не заполнено в .env: PRODAMUS_SECRET"
     cfg.pay_secret = "k"
     cfg.validate()
     assert cfg.payments_enabled and cfg.notify_url == "https://bot.example.ru/pay/notify"

@@ -134,8 +134,8 @@ async def run(cfg: Config, session: BaseSession | None = None) -> None:
             await shop._notify_admins(texts.ADMIN_STARTED.format(mode=mode, notify_url=cfg.notify_url)
                                       + (texts.TEST_MODE_WARNING if cfg.test_mode else ""))
         else:
-            log.warning("Данные Prodamus не указаны — режим витрины: бот всё показывает, но оплату пока не принимает.")
-            await shop._notify_admins(texts.ADMIN_STARTED_SHOWCASE)
+            log.warning("Режим витрины (%s): бот всё показывает, но оплату пока не принимает.", cfg.showcase_reason)
+            await shop._notify_admins(texts.ADMIN_STARTED_SHOWCASE.format(reason=cfg.showcase_reason))
 
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
