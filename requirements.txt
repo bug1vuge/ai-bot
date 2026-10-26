@@ -1,0 +1,7 @@
+aiogram==3.31.0
+aiohttp==3.14.5
+aiohttp-socks==0.12.0
+aiosqlite==0.22.1
+pypdf==5.9.0
+reportlab==5.0.1
+python-dotenv==1.2.3

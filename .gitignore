@@ -1,0 +1,16 @@
+# secrets and runtime data
+.env
+data/bot.db
+data/bot.db-*
+
+# paid product and offline wheels are distributed separately, never via git
+data/guide.pdf
+data/*.pdf
+wheels/
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/
