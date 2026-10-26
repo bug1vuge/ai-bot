@@ -1,5 +1,6 @@
 """Работа с Робокассой: ссылка на оплату, проверка уведомлений, запрос статуса платежа."""
 import hashlib
+import hmac
 import json
 import logging
 import xml.etree.ElementTree as ET
@@ -71,7 +72,7 @@ class Robokassa:
             return False
         shp = {k: v for k, v in data.items() if k.startswith("Shp_")}
         expected = self.sign(out_sum, inv_id, self.password2, *_shp_part(shp))
-        return expected.lower() == signature.strip().lower()
+        return hmac.compare_digest(expected.lower(), signature.strip().lower())
 
     # ---------- запрос статуса (запасной способ) ----------
     async def _get_session(self) -> aiohttp.ClientSession:
