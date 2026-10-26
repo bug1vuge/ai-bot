@@ -591,3 +591,15 @@ async def test_grant_reports_failure(shop, monkeypatch):
     assert await shop.grant(222) == "delivery_failed"
     await shop.poll_once()
     assert len(shop.bot.documents) == 1
+
+
+async def test_live_mode_rejects_test_notifications(shop):
+    shop.cfg.rk_test = shop.kassa.is_test = False
+    pid, _ = await shop.get_or_create_payment(USER)
+    async with TestClient(TestServer(make_app(shop))) as client:
+        r = await client.post("/robokassa/result", data={**result_params(pid), "IsTest": "1"})
+        assert r.status == 400
+        r = await client.post("/robokassa/result", data=result_params(pid))
+        assert r.status == 200
+    await shop.wait_background()
+    assert len(shop.bot.documents) == 1

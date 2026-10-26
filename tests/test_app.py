@@ -100,6 +100,7 @@ async def app(tmp_path, sample_pdf, monkeypatch):
     cfg.bot_token = "123456:" + "A" * 35
     cfg.rk_login, cfg.rk_password1, cfg.rk_password2, cfg.rk_test, cfg.rk_hash = LOGIN, P1, P2, True, "md5"
     cfg.admin_ids = [999]
+    cfg.rk_test_public = True
     cfg.web_enabled, cfg.web_host, cfg.web_port = True, "127.0.0.1", free_port()
     cfg.public_url, cfg.offer_url = "https://example.test", "https://example.test/offer"
     cfg.product_file, cfg.db_path = sample_pdf, tmp_path / "bot.db"

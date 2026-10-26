@@ -55,6 +55,10 @@ def make_app(shop: Shop) -> web.Application:
         data = await _params(request)
         if not shop.cfg.payments_enabled:
             return web.Response(status=503, text="payments disabled")
+        if data.get("IsTest") == "1" and not shop.cfg.rk_test:
+            # боевой магазин не принимает тестовые оплаты, даже с верной подписью
+            log.warning("Тестовое уведомление в боевом режиме отклонено: InvId=%s", data.get("InvId"))
+            return web.Response(status=400, text="test payment in live mode")
         if not shop.kassa.check_result_signature(data):
             log.warning("Неверная подпись уведомления от %s: InvId=%s", request.remote, data.get("InvId"))
             return web.Response(status=400, text="bad sign")

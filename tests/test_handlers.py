@@ -40,6 +40,7 @@ class RecordingSession(BaseSession):
 async def env(tmp_path, sample_pdf):
     cfg = make_cfg(tmp_path, sample_pdf)
     cfg.admin_ids = []
+    cfg.rk_test_public = True
     cfg.seller_info = "Иванов Иван, самозанятый, ИНН 123456789012"
     cfg.offer_url = "https://example.com/offer"
     cfg.support_username = "help_me"
@@ -315,3 +316,21 @@ async def test_start_delivers_undelivered_guide(env, monkeypatch):
     session.make_request = real                   # пользователь разблокировал бота
     await dp.feed_update(bot, msg_update(320, "/start"))
     assert docs_of(session) == 1
+
+
+async def test_test_mode_is_closed_for_regular_users(env):
+    """В тестовом режиме гайд выдаётся без денег — обычный пользователь ссылку на оплату не получает."""
+    dp, bot, shop, session = env
+    shop.cfg.rk_test_public = False
+    await dp.feed_update(bot, msg_update(400, "/start"))
+    await dp.feed_update(bot, cb_update(401, "buy"))
+    pay_msg = [c for c in session.calls if isinstance(c, SendMessage)][-1]
+    assert pay_msg.reply_markup.inline_keyboard[0][0].callback_data == "soon"
+    assert await shop.db.latest_pending(111) is None
+    shop.cfg.admin_ids = [111]                         # администратор может проверить оплату
+    await dp.feed_update(bot, cb_update(402, "buy"))
+    pay_msg = [c for c in session.calls if isinstance(c, SendMessage)][-1]
+    assert "IsTest=1" in pay_msg.reply_markup.inline_keyboard[0][0].url
+    shop.cfg.admin_ids, shop.cfg.rk_test = [], False   # боевой режим — покупают все
+    await dp.feed_update(bot, cb_update(403, "buy"))
+    assert [c for c in session.calls if isinstance(c, SendMessage)][-1].reply_markup.inline_keyboard[0][0].url

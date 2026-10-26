@@ -56,6 +56,9 @@ class Config:
     rk_password1: str = field(default_factory=lambda: _env("ROBOKASSA_PASSWORD1"))
     rk_password2: str = field(default_factory=lambda: _env("ROBOKASSA_PASSWORD2"))
     rk_test: bool = field(default_factory=lambda: _bool("ROBOKASSA_TEST", True))
+    # В тестовом режиме гайд выдаётся без настоящей оплаты, поэтому покупать могут только
+    # администраторы. true — открыть тестовую покупку всем (например, для проверки модератором).
+    rk_test_public: bool = field(default_factory=lambda: _bool("ROBOKASSA_TEST_PUBLIC", False))
     rk_hash: str = field(default_factory=lambda: _env("ROBOKASSA_HASH", "md5").lower())
     rk_send_receipt: bool = field(default_factory=lambda: _bool("ROBOKASSA_SEND_RECEIPT", False))
     receipt_item_name: str = field(default_factory=lambda: _env("RECEIPT_ITEM_NAME", "Электронное руководство ИИ без тёмного леса, PDF"))
@@ -104,6 +107,12 @@ class Config:
     def payments_enabled(self) -> bool:
         """Без данных Робокассы бот работает в режиме витрины: всё показывает, но оплату не принимает."""
         return bool(self.rk_login and self.rk_password1 and self.rk_password2)
+
+    def can_buy(self, user_id: int) -> bool:
+        """Можно ли этому пользователю выдать ссылку на оплату."""
+        if not self.payments_enabled:
+            return False
+        return not self.rk_test or self.rk_test_public or user_id in self.admin_ids
 
     def validate(self) -> None:
         if not self.bot_token:

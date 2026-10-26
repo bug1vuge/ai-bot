@@ -112,8 +112,9 @@ async def buy(call: CallbackQuery, shop: Shop, bot: Bot):
     if await shop.db.has_paid(user_id):
         await _send(bot, user_id, texts.ALREADY_BOUGHT, reply_markup=main_kb(shop, True))
         return
-    if not shop.cfg.payments_enabled:
-        # Режим витрины: тот же экран оплаты, но кнопка пока не ведёт в кассу
+    if not shop.cfg.can_buy(user_id):
+        # Режим витрины (или тестовый режим для обычных пользователей):
+        # тот же экран оплаты, но кнопка пока не ведёт в кассу
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=texts.BTN_PAY.format(price=_price(shop)), callback_data="soon")]])
         await _send(bot, user_id, _pay_text(shop), reply_markup=kb)
