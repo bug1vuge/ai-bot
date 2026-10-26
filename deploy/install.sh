@@ -217,14 +217,23 @@ CADDY
 else
   say "Настраиваю HTTPS для адресов бота (nginx + certbot)"
   NGX=/etc/nginx/conf.d/guide-bot.conf
+  # Ручные настройки бота из прошлых инструкций (guide-bot-*.conf) — наши, их заменяет основной файл
+  for extra in /etc/nginx/conf.d/guide-bot-*.conf; do
+    [[ -e "$extra" ]] || continue
+    echo "Убираю старую настройку бота: $extra"
+    mv "$extra" "/root/$(basename "$extra").backup.$(date +%s)"
+  done
+  # Проверяем, не занят ли домен чужим сайтом, ДО любых изменений в nginx
+  domain_re="${DOMAIN//./\\.}"
+  other=$(grep -rlsE "server_name[^;]*[[:space:]]${domain_re}[[:space:];]" /etc/nginx/ | grep -vx "$NGX" || true)
+  if [[ -n "$other" ]]; then
+    die "Домен $DOMAIN уже используется другим сайтом в nginx: $other
+    Запустите скрипт без домена (будет адрес вида 1-2-3-4.sslip.io) или укажите новый поддомен."
+  fi
   if [[ -f "$NGX" ]] && ! grep -q "server_name $DOMAIN;" "$NGX"; then
     # адрес бота сменился (например, с sslip.io на свой домен) — настраиваем заново
     echo "Адрес бота изменился — заменяю настройки nginx для бота."
     mv "$NGX" "/root/guide-bot-nginx.backup.$(date +%s).conf"
-  fi
-  if [[ ! -f "$NGX" ]] && grep -rqs "server_name[^;]*\b$DOMAIN\b" /etc/nginx/; then
-    die "Домен $DOMAIN уже используется другим сайтом в nginx. Запустите скрипт без домена
-    (будет адрес вида 1-2-3-4.sslip.io) или укажите новый поддомен."
   fi
   if [[ -f "$NGX" ]] && grep -q "ssl_certificate" "$NGX"; then
     # повторный запуск: сертификат уже выпущен, обновляем только порт
