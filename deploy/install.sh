@@ -89,8 +89,8 @@ if [[ "$SRC_DIR" != "$APP_DIR" ]]; then
   if [[ -f "$SRC_DIR/.env" && ! -f "$APP_DIR/.env" ]]; then cp "$SRC_DIR/.env" "$APP_DIR/.env"; fi
 fi
 [[ -f "$APP_DIR/.env" ]] || cp "$APP_DIR/.env.example" "$APP_DIR/.env"
-# настройки Робокассы больше не используются (оплата через Prodamus)
-sed -i '/^ROBOKASSA_/d' "$APP_DIR/.env"
+# настройки прежних платёжных систем больше не используются (оплата через ЮKassa)
+sed -i -E '/^(ROBOKASSA_|PRODAMUS_)/d' "$APP_DIR/.env"
 
 ENVTOOL="python3 $APP_DIR/deploy/set_env.py $APP_DIR/.env"
 
@@ -124,8 +124,8 @@ if [[ -t 0 ]]; then
   ask SELLER_NAME "ФИО точно как в паспорте и в «Мой налог» (для оферты и описания бота)"
   ask SELLER_INN "Ваш ИНН"
   ask SELLER_EMAIL "E-mail для связи с покупателями"
-  ask PRODAMUS_URL "Адрес платёжной страницы Prodamus (например https://aibezlesa.payform.ru)"
-  ask PRODAMUS_SECRET "Секретный ключ платёжной страницы Prodamus" secret
+  ask YOOKASSA_SHOP_ID "ЮKassa: shopId (кабинет ЮKassa → Интеграция → Ключи API)"
+  ask YOOKASSA_SECRET_KEY "ЮKassa: секретный ключ (live_…)" secret
 fi
 [[ -n "$($ENVTOOL BOT_TOKEN)" ]] || die "В $APP_DIR/.env не указан BOT_TOKEN. Впишите его: nano $APP_DIR/.env — и запустите скрипт снова."
 
@@ -242,7 +242,7 @@ else
       sed -i "s#^    location = /health {#    location = /offer {\n        proxy_pass http://127.0.0.1:$BOT_PORT;\n    }\n    location = /health {#" "$NGX"
     fi
     if ! grep -q "location /pay/" "$NGX"; then
-      # адреса Prodamus (раньше были только адреса Робокассы)
+      # адреса оплаты (раньше были только адреса Робокассы)
       sed -i "s#^    location = /health {#    location /pay/ {\n        proxy_pass http://127.0.0.1:$BOT_PORT;\n        proxy_set_header Host \$host;\n        proxy_set_header X-Forwarded-For \$remote_addr;\n        proxy_set_header X-Forwarded-Proto \$scheme;\n    }\n    location = /health {#" "$NGX"
     fi
   else
@@ -307,10 +307,10 @@ done
 cat <<DONE
 
 ==================================================================
- Готово! В личном кабинете Prodamus, в настройках платёжной страницы:
+ Готово! В личном кабинете ЮKassa → Интеграция → HTTP-уведомления:
 
    URL для уведомлений:  $PUBLIC_URL/pay/notify
-   Секретный ключ — тот же, что в PRODAMUS_SECRET в $APP_DIR/.env
+   События: payment.succeeded, payment.canceled, payment.waiting_for_capture, refund.succeeded
 
  Оферта (проверьте ФИО, ИНН и контакты):  $PUBLIC_URL/offer
 
