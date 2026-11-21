@@ -29,3 +29,17 @@ def build_sample_pdf(path: Path) -> Path:
 @pytest.fixture(scope="session")
 def sample_pdf(tmp_path_factory) -> Path:
     return build_sample_pdf(tmp_path_factory.mktemp("product") / "guide.pdf")
+
+
+@pytest.fixture
+async def yk():
+    """Поддельный API ЮKassa на локальном порту; адрес — yk.url."""
+    from aiohttp.test_utils import TestServer
+
+    from tests.fake_yookassa import FakeYooKassa
+    fake = FakeYooKassa()
+    server = TestServer(fake.app())
+    await server.start_server()
+    fake.url = str(server.make_url("/v3"))
+    yield fake
+    await server.close()

@@ -39,7 +39,11 @@ CREATE TABLE IF NOT EXISTS payments (
     is_test           INTEGER NOT NULL DEFAULT 0,
     delivery_attempts INTEGER NOT NULL DEFAULT 0,
     next_attempt_at   TEXT,
-    checked_at        TEXT
+    checked_at        TEXT,
+    provider_id       TEXT,
+    refund_state      TEXT,
+    refund_attempts   INTEGER NOT NULL DEFAULT 0,
+    note              TEXT
 );
 CREATE TABLE IF NOT EXISTS counters (
     name  TEXT PRIMARY KEY,
@@ -49,6 +53,11 @@ CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id);
 CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
 """
 
+# Индексы по колонкам, которые могли появиться только после миграции
+INDEXES = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_provider ON payments(provider_id);
+"""
+
 # Колонки, добавленные после первого релиза: старые базы на серверах дополняются при запуске
 MIGRATIONS = {
     "payments": {
@@ -56,12 +65,24 @@ MIGRATIONS = {
         "delivery_attempts": "INTEGER NOT NULL DEFAULT 0",
         "next_attempt_at": "TEXT",
         "checked_at": "TEXT",
+        "provider_id": "TEXT",
+        "refund_state": "TEXT",
+        "refund_attempts": "INTEGER NOT NULL DEFAULT 0",
+        "note": "TEXT",
     },
     "users": {
         "file_id": "TEXT",
         "file_key": "TEXT",
     },
 }
+
+# Статусы заказа (payments.status):
+#   pending   — ждёт оплаты;            succeeded — оплачен (гайд выдаётся);
+#   canceled  — не оплачен / отменён;    refunded  — оплачен, затем деньги возвращены;
+#   duplicate — повторная оплата покупателя, у которого гайд уже есть: деньги возвращаются;
+#   review    — платёж не прошёл проверку (сумма, магазин, метаданные) — разбирается администратор.
+PENDING, SUCCEEDED, CANCELED, REFUNDED, DUPLICATE, REVIEW = (
+    "pending", "succeeded", "canceled", "refunded", "duplicate", "review")
 
 # Состояние выдачи (payments.delivered)
 NOT_DELIVERED, DELIVERED, SENDING = 0, 1, 2
@@ -98,6 +119,8 @@ class Database:
         await self.conn.executescript(SCHEMA)
         async with self.transaction():
             await self._migrate()
+        await self.conn.executescript(INDEXES)
+        async with self.transaction():
             # Выдача, прерванная перезапуском бота посреди отправки, будет повторена.
             # Лучше в редком случае прислать файл дважды, чем не прислать вовсе.
             cur = await self.conn.execute("UPDATE payments SET delivered=? WHERE delivered=?", (NOT_DELIVERED, SENDING))
@@ -191,8 +214,8 @@ class Database:
         """Уникальный номер заказа — одним атомарным запросом.
 
         Номер не меньше текущего Unix-времени: если база потеряется или бота переустановят,
-        новые заказы не совпадут со старыми в Prodamus, и старое уведомление об оплате
-        не будет принято за оплату нового заказа."""
+        новые заказы не совпадут со старыми, и ключи идемпотентности ЮKassa (номер заказа)
+        не повторятся."""
         floor = int(time.time())
         async with self._lock, self.conn.execute(
             """INSERT INTO counters (name, value) VALUES ('inv_id', ?)
@@ -225,27 +248,101 @@ class Database:
     async def get_payment(self, payment_id: str):
         return await self._one("SELECT * FROM payments WHERE payment_id=?", (payment_id,))
 
-    async def fresh_pending(self, user_id: int, ttl_min: int, amount: str, is_test: bool):
-        """Неоплаченный заказ пользователя, созданный недавно на ту же сумму и в том же режиме, —
-        чтобы не плодить ссылки. После смены цены или режима создаётся новый заказ."""
-        since = iso(now() - timedelta(minutes=ttl_min))
-        return await self._one(
-            """SELECT * FROM payments WHERE user_id=? AND status='pending' AND created_at>=?
-                 AND amount=? AND is_test=? AND manual=0
-               ORDER BY created_at DESC LIMIT 1""",
-            (user_id, since, amount, int(is_test)),
-        )
+    async def set_provider(self, payment_id: str, provider_id: str, url: str) -> None:
+        """Заказ получил платёж в ЮKassa и ссылку на оплату."""
+        await self._write("UPDATE payments SET provider_id=?, confirmation_url=? WHERE payment_id=?",
+                          (provider_id, url, payment_id))
 
-    async def latest_pending(self, user_id: int):
+    async def by_provider(self, provider_id: str):
+        return await self._one("SELECT * FROM payments WHERE provider_id=?", (provider_id,))
+
+    async def open_order(self, user_id: int):
+        """Неоплаченный заказ пользователя. Живой заказ у пользователя всегда один."""
         return await self._one(
-            "SELECT * FROM payments WHERE user_id=? AND status='pending' ORDER BY created_at DESC LIMIT 1", (user_id,))
+            "SELECT * FROM payments WHERE user_id=? AND status=? AND manual=0 ORDER BY created_at DESC LIMIT 1",
+            (user_id, PENDING))
+
+    async def set_status(self, payment_id: str, status: str, *, only_from: tuple[str, ...] = (PENDING,),
+                         note: str | None = None) -> bool:
+        """Переход статуса только из разрешённых состояний: оплаченный заказ нельзя «отменить» и т.п."""
+        marks = ",".join("?" * len(only_from))
+        rows = await self._write(
+            f"UPDATE payments SET status=?, note=COALESCE(?, note) WHERE payment_id=? AND status IN ({marks})",
+            (status, note, payment_id, *only_from))
+        return rows == 1
+
+    async def settle_paid(self, payment_id: str) -> str:
+        """Атомарно фиксирует успешную оплату заказа.
+
+        Возвращает: paid — заказ стал оплаченным; already — уже был оплачен; duplicate — у покупателя
+        уже есть другой оплаченный заказ (эта оплата лишняя и подлежит возврату); final — заказ в
+        конечном статусе (возврат, проверка) и не меняется."""
+        async with self.transaction() as conn:
+            async with conn.execute("SELECT user_id, status FROM payments WHERE payment_id=?", (payment_id,)) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                return "final"
+            if row["status"] == SUCCEEDED:
+                return "already"
+            if row["status"] not in (PENDING, CANCELED):
+                return "final"
+            async with conn.execute(
+                "SELECT 1 FROM payments WHERE user_id=? AND status=? AND payment_id<>? LIMIT 1",
+                (row["user_id"], SUCCEEDED, payment_id),
+            ) as cur:
+                other = await cur.fetchone()
+            new = DUPLICATE if other else SUCCEEDED
+            await conn.execute("UPDATE payments SET status=?, paid_at=COALESCE(paid_at, ?) WHERE payment_id=?",
+                               (new, iso(now()), payment_id))
+            return "duplicate" if other else "paid"
 
     async def mark_paid(self, payment_id: str) -> None:
-        """Заказ оплачен."""
+        """Заказ оплачен (ручная выдача администратором)."""
         await self._write(
             "UPDATE payments SET status='succeeded', paid_at=COALESCE(paid_at, ?) WHERE payment_id=?",
             (iso(now()), payment_id),
         )
+
+    async def pending_for_polling(self, fresh_min: int, max_age_hours: int, slow_interval_min: int) -> list[str]:
+        """Неоплаченные заказы с платежом в ЮKassa — для фоновой проверки статуса.
+        Свежие проверяются каждый круг, старые (до max_age_hours) — не чаще раза в slow_interval_min:
+        покупатель мог оплатить позже, а уведомление — потеряться."""
+        t = now()
+        return [r["payment_id"] for r in await self._all(
+            """SELECT payment_id FROM payments
+               WHERE status=? AND manual=0 AND provider_id IS NOT NULL AND created_at>=?
+                 AND (created_at>=? OR checked_at IS NULL OR checked_at<?)
+               ORDER BY created_at DESC""",
+            (PENDING, iso(t - timedelta(hours=max_age_hours)), iso(t - timedelta(minutes=fresh_min)),
+             iso(t - timedelta(minutes=slow_interval_min))))]
+
+    async def mark_checked(self, payment_id: str) -> None:
+        await self._write("UPDATE payments SET checked_at=? WHERE payment_id=?", (iso(now()), payment_id))
+
+    async def expire_unsent(self, older_than_hours: int) -> int:
+        """Заказы, для которых платёж в ЮKassa так и не создался, — закрываем."""
+        return await self._write(
+            "UPDATE payments SET status=?, note='платёж не создан' WHERE status=? AND provider_id IS NULL "
+            "AND manual=0 AND created_at<?",
+            (CANCELED, PENDING, iso(now() - timedelta(hours=older_than_hours))))
+
+    async def expire_stale(self, older_than_hours: int) -> int:
+        """Очень старые неоплаченные заказы больше не проверяются — закрываем."""
+        return await self._write(
+            "UPDATE payments SET status=?, note=COALESCE(note, 'истёк срок') WHERE status=? AND manual=0 AND created_at<?",
+            (CANCELED, PENDING, iso(now() - timedelta(hours=older_than_hours))))
+
+    async def set_refund_state(self, payment_id: str, state: str, *, attempt: bool = False) -> None:
+        await self._write(
+            "UPDATE payments SET refund_state=?, refund_attempts=refund_attempts+? WHERE payment_id=?",
+            (state, int(attempt), payment_id))
+
+    async def refunds_to_retry(self, max_attempts: int) -> list[str]:
+        """Повторные оплаты, деньги по которым ещё не возвращены."""
+        return [r["payment_id"] for r in await self._all(
+            """SELECT payment_id FROM payments WHERE status=? AND provider_id IS NOT NULL
+                 AND COALESCE(refund_state, '') NOT IN ('requested', 'succeeded', 'manual') AND refund_attempts<?""",
+            (DUPLICATE, max_attempts))]
 
     async def claim_delivery(self, payment_id: str) -> bool:
         """Атомарно «забирает» выдачу: True только для одного вызова. Защита от двойной выдачи."""
@@ -296,6 +393,10 @@ class Database:
             (user_id, DELIVERED, exclude))
         return row[0]
 
+    async def has_status(self, user_id: int, status: str) -> bool:
+        return await self._one(
+            "SELECT 1 FROM payments WHERE user_id=? AND status=? LIMIT 1", (user_id, status)) is not None
+
     async def has_paid(self, user_id: int) -> bool:
         return await self._one(
             "SELECT 1 FROM payments WHERE user_id=? AND status='succeeded' LIMIT 1", (user_id,)) is not None
@@ -309,6 +410,9 @@ class Database:
             "manual": "SELECT COUNT(*) FROM payments WHERE status='succeeded' AND manual=1",
             "test_sales": "SELECT COUNT(*) FROM payments WHERE status='succeeded' AND manual=0 AND is_test=1",
             "pending": "SELECT COUNT(*) FROM payments WHERE status='pending'",
+            "refunded": "SELECT COUNT(*) FROM payments WHERE status='refunded'",
+            "duplicates": "SELECT COUNT(*) FROM payments WHERE status='duplicate'",
+            "review": "SELECT COUNT(*) FROM payments WHERE status='review'",
             "undelivered": f"SELECT COUNT(*) FROM payments WHERE status='succeeded' AND delivered<>{DELIVERED}",
             "today_sales": f"SELECT COUNT(*) FROM payments WHERE {REAL_SALE} AND paid_at>=date('now')",
             "today_users": "SELECT COUNT(*) FROM users WHERE created_at>=date('now')",

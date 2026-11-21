@@ -11,7 +11,8 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import CallbackQuery, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from . import texts
-from .service import Shop
+from .service import AlreadyPaid, PaymentInReview, Shop
+from .yookassa import YooKassaError
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -85,13 +86,13 @@ async def start(message: Message, command: CommandObject, shop: Shop, bot: Bot):
         return
     paid = await shop.db.has_paid(user.id)
 
-    # Пользователь вернулся со страницы оплаты Prodamus (кнопка возврата в магазин)
+    # Пользователь вернулся со страницы оплаты ЮKassa (кнопка «Вернуться в магазин»)
     if payload == "paid":
         if paid:
             # гайд уже пришёл по уведомлению об оплате — не дублируем файл
             await message.answer(texts.PAID_ALREADY_SENT, reply_markup=main_kb(shop, True))
             return
-        pending = await shop.db.latest_pending(user.id)
+        pending = await shop.db.open_order(user.id)
         if pending:
             await _wait_for_payment(bot, shop, user.id, pending["payment_id"])
             return
@@ -123,6 +124,19 @@ async def buy(call: CallbackQuery, shop: Shop, bot: Bot):
         return
     try:
         payment_id, url = await shop.get_or_create_payment(user_id)
+    except AlreadyPaid:
+        # оплата нашлась прямо сейчас (например, уведомление ещё не дошло) — гайд уже отправляется
+        await shop.wait_background(timeout=10)
+        if not await shop.deliver_pending_for_user(user_id):
+            await _send(bot, user_id, texts.PAID_ALREADY_SENT, reply_markup=main_kb(shop, True))
+        return
+    except PaymentInReview:
+        await _send(bot, user_id, texts.CHECK_REVIEW)
+        return
+    except YooKassaError as e:
+        log.warning("Не удалось создать платёж для %s: %s", user_id, e)
+        await _send(bot, user_id, texts.CREATE_ERROR)
+        return
     except Exception:
         log.exception("Не удалось создать платёж для %s", user_id)
         await _send(bot, user_id, texts.CREATE_ERROR)
@@ -151,19 +165,22 @@ async def check(call: CallbackQuery, shop: Shop, bot: Bot):
 
 
 async def _wait_for_payment(bot: Bot, shop: Shop, user_id: int, payment_id: str):
-    """Покупатель вернулся со страницы оплаты раньше, чем дошло уведомление Prodamus.
+    """Покупатель вернулся со страницы оплаты раньше, чем дошло уведомление ЮKassa.
     Несколько секунд ждём подтверждения, чтобы не пугать его «оплата не поступила»."""
     await _send(bot, user_id, texts.CHECKING_PAYMENT)
     status = "pending"
     for attempt in range(RETURN_CHECKS):
         try:
             status = await shop.process_payment(payment_id)
+        except YooKassaError as e:
+            log.warning("Проверка заказа %s: ЮKassa недоступна: %s", payment_id, e)
+            status = "error"
         except Exception:
             log.exception("Ошибка проверки платежа %s", payment_id)
             status = "error"
-        if status in {"succeeded", "already_delivered", "in_progress"}:
-            return  # гайд отправлен — сообщение «Оплата прошла» уже в чате
-        if status in {"delivery_failed", "canceled"}:
+        if status in {"succeeded", "already_delivered", "in_progress", "duplicate"}:
+            return  # гайд отправлен (или покупатель уже получил сообщение о возврате лишней оплаты)
+        if status in {"delivery_failed", "canceled", "review", "refunded"}:
             break
         if attempt < RETURN_CHECKS - 1:
             await asyncio.sleep(RETURN_CHECK_PAUSE)
@@ -173,6 +190,9 @@ async def _wait_for_payment(bot: Bot, shop: Shop, user_id: int, payment_id: str)
 async def _check_and_reply(bot: Bot, shop: Shop, user_id: int, payment_id: str):
     try:
         status = await shop.process_payment(payment_id)
+    except YooKassaError as e:
+        log.warning("Проверка заказа %s: ЮKassa недоступна: %s", payment_id, e)
+        status = "error"
     except Exception:
         log.exception("Ошибка проверки платежа %s", payment_id)
         status = "error"
@@ -190,6 +210,12 @@ async def _reply_status(bot: Bot, shop: Shop, user_id: int, status: str):
         await _send(bot, user_id, texts.CHECK_DELIVERY_RETRY)
     elif status == "canceled":
         await _send(bot, user_id, texts.CHECK_CANCELED, reply_markup=main_kb(shop, False))
+    elif status == "duplicate":
+        await _send(bot, user_id, texts.PAID_ALREADY_SENT, reply_markup=main_kb(shop, True))
+    elif status == "review":
+        await _send(bot, user_id, texts.CHECK_REVIEW)
+    elif status == "refunded":
+        await _send(bot, user_id, texts.CHECK_REFUNDED)
     else:
         await _send(bot, user_id, texts.CHECK_PENDING)
 
@@ -265,6 +291,10 @@ async def stats(message: Message, shop: Shop):
     ]
     if s["test_sales"]:
         lines.append(f"Тестовых оплат (не входят в выручку): {s['test_sales']}")
+    if s["refunded"] or s["duplicates"]:
+        lines.append(f"Возвраты: {s['refunded']} · повторных оплат (возвращены): {s['duplicates']}")
+    if s["review"]:
+        lines.append(f"🚨 Платежей на проверке: <b>{s['review']}</b> — см. сообщения бота")
     if s["undelivered"]:
         lines.append(f"⚠️ Оплачено, но не выдано: <b>{s['undelivered']}</b> — бот повторяет отправку")
     lines += ["", "<b>Источники трафика</b> (пользователи → покупатели):"]
@@ -296,31 +326,19 @@ async def grant(message: Message, command: CommandObject, shop: Shop):
 
 @router.message(Command("check"))
 async def admin_check(message: Message, command: CommandObject, shop: Shop):
-    """Проверка заказа по номеру (как в личном кабинете Prodamus, поле «Номер заказа»)."""
+    """Проверка заказа по номеру: бот запрашивает платёж в ЮKassa и, если он оплачен, выдаёт гайд.
+    Номер заказа — в описании платежа в кабинете ЮKassa («… (заказ 1793005224-123)»)."""
     if not _is_admin(shop, message.from_user.id):
         return await fallback(message, shop)
     pid = (command.args or "").strip()
-    if not shop.cfg.payments_enabled:
-        await message.answer("Данные Prodamus ещё не указаны в .env — проверять нечего.")
-        return
     if not _ORDER_RE.fullmatch(pid):
         await message.answer("Использование: <code>/check номер_заказа</code>, например <code>/check 1793005224-111</code>")
         return
-    status = await shop.process_payment(pid)
-    await message.answer(f"Заказ <code>{pid}</code>: {texts.ADMIN_STATUS.get(status, status)}")
-
-
-@router.message(Command("paid"))
-async def admin_paid(message: Message, command: CommandObject, shop: Shop):
-    """Подтвердить оплату вручную — если в кабинете Prodamus оплата есть, а уведомление до бота не дошло."""
-    if not _is_admin(shop, message.from_user.id):
-        return await fallback(message, shop)
-    pid = (command.args or "").strip()
-    if not _ORDER_RE.fullmatch(pid):
-        await message.answer("Использование: <code>/paid номер_заказа</code> — только после того, как увидели "
-                             "оплату в личном кабинете Prodamus.")
+    try:
+        status = await shop.process_payment(pid)
+    except YooKassaError as e:
+        await message.answer(f"ЮKassa не ответила: {html.escape(str(e))}. Попробуйте через минуту.")
         return
-    status = await shop.confirm_manually(pid)
     await message.answer(f"Заказ <code>{pid}</code>: {texts.ADMIN_STATUS.get(status, status)}")
 
 

@@ -19,9 +19,9 @@ from .db import Database
 from .handlers import router
 from .middlewares import ThrottleMiddleware
 from .offer import missing_fields
-from .prodamus import Prodamus
 from .service import Shop
 from .web import make_app
+from .yookassa import YooKassa
 
 log = logging.getLogger("bot")
 
@@ -88,7 +88,7 @@ async def run(cfg: Config, session: BaseSession | None = None) -> None:
     cfg.validate()
     db = Database(cfg.db_path)
     await db.connect()
-    pay = Prodamus(cfg.pay_url, cfg.pay_secret)
+    pay = YooKassa(cfg.shop_id, cfg.secret_key, cfg.api_url)
     if session is None:
         session = AiohttpSession(proxy=cfg.telegram_proxy) if cfg.telegram_proxy else AiohttpSession()
     bot = Bot(cfg.bot_token, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -115,7 +115,7 @@ async def run(cfg: Config, session: BaseSession | None = None) -> None:
                                   "Его использует другая программа — укажите другой WEB_PORT в .env.") from None
             log.info("Веб-сервер слушает %s:%s", cfg.web_host, cfg.web_port)
             if cfg.public_url:
-                log.info("Адрес для уведомлений Prodamus: %s", cfg.notify_url)
+                log.info("Адрес для HTTP-уведомлений ЮKassa: %s", cfg.notify_url)
                 log.info("Оферта: %s", cfg.offer_url)
 
         # 2. Фоновая повторная выдача и резервные копии
@@ -130,8 +130,8 @@ async def run(cfg: Config, session: BaseSession | None = None) -> None:
         log.info("Бот @%s запущен. Цена %s ₽, водяной знак: %s", shop.bot_username, cfg.price_rub, cfg.watermark)
         if cfg.payments_enabled:
             mode = "тестовый (покупают только администраторы)" if cfg.test_mode else "боевой"
-            log.info("Prodamus: %s, режим %s", cfg.pay_url, mode)
-            await shop._notify_admins(texts.ADMIN_STARTED.format(mode=mode, notify_url=cfg.notify_url)
+            log.info("ЮKassa: магазин %s, режим %s", cfg.shop_id, mode)
+            await shop._notify_admins(texts.ADMIN_STARTED.format(mode=mode, shop_id=cfg.shop_id, notify_url=cfg.notify_url)
                                       + (texts.TEST_MODE_WARNING if cfg.test_mode else ""))
         else:
             log.warning("Режим витрины (%s): бот всё показывает, но оплату пока не принимает.", cfg.showcase_reason)
@@ -147,6 +147,7 @@ async def run(cfg: Config, session: BaseSession | None = None) -> None:
         await shop.wait_background()
         if runner:
             await runner.cleanup()
+        await pay.close()
         await db.close()
         await bot.session.close()
 

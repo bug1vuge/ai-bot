@@ -52,13 +52,17 @@ def _env(name: str, default: str = "") -> str:
 class Config:
     bot_token: str = field(default_factory=lambda: _env("BOT_TOKEN"))
 
-    # ---- Prodamus ----
-    # Адрес платёжной страницы, например https://aibezlesa.payform.ru
-    pay_url: str = field(default_factory=lambda: _env("PRODAMUS_URL").rstrip("/"))
-    # Секретный ключ платёжной страницы (Настройки → Уведомления / Интеграции)
-    pay_secret: str = field(default_factory=lambda: _env("PRODAMUS_SECRET"))
-    # Тестовый режим: покупать могут только администраторы (ADMIN_IDS). Включайте, пока платёжная
-    # страница в демо-режиме или идёт проверка: тогда гайд не уйдёт посторонним без настоящей оплаты.
+    # ---- ЮKassa ----
+    # Идентификатор магазина (shopId) и секретный ключ: личный кабинет ЮKassa → Интеграция → Ключи API
+    shop_id: str = field(default_factory=lambda: _env("YOOKASSA_SHOP_ID"))
+    secret_key: str = field(default_factory=lambda: _env("YOOKASSA_SECRET_KEY"))
+    api_url: str = field(default_factory=lambda: _env("YOOKASSA_API_URL", "https://api.yookassa.ru/v3").rstrip("/"))
+    # Принимать уведомления только с адресов ЮKassa. Даже без этой проверки поддельное уведомление
+    # ничего не даёт: бот всегда перепроверяет платёж через API.
+    check_ip: bool = field(default_factory=lambda: _bool("YOOKASSA_CHECK_IP", True))
+    # Второй успешный платёж того же покупателя автоматически возвращается
+    auto_refund_duplicates: bool = field(default_factory=lambda: _bool("AUTO_REFUND_DUPLICATES", True))
+    # Тестовый режим (тестовый магазин ЮKassa): ссылку на оплату получают только администраторы.
     test_mode: bool = field(default_factory=lambda: _bool("PAYMENTS_TEST_MODE", False))
 
     # ---- товар ----
@@ -103,15 +107,15 @@ class Config:
 
     @property
     def payments_enabled(self) -> bool:
-        """Без данных Prodamus бот работает в режиме витрины: всё показывает, но оплату не принимает."""
-        return bool(self.pay_url and self.pay_secret and self.public_url)
+        """Без данных ЮKassa бот работает в режиме витрины: всё показывает, но оплату не принимает."""
+        return bool(self.shop_id and self.secret_key and self.public_url)
 
     @property
     def showcase_reason(self) -> str:
         """Почему оплата выключена (пусто — включена)."""
         if self.payments_enabled:
             return ""
-        missing = [name for name, value in (("PRODAMUS_URL", self.pay_url), ("PRODAMUS_SECRET", self.pay_secret),
+        missing = [name for name, value in (("YOOKASSA_SHOP_ID", self.shop_id), ("YOOKASSA_SECRET_KEY", self.secret_key),
                                             ("PUBLIC_URL", self.public_url)) if not value]
         return "не заполнено в .env: " + ", ".join(missing)
 
@@ -124,14 +128,20 @@ class Config:
     def validate(self) -> None:
         if not self.bot_token:
             raise ConfigError("Не заполнен BOT_TOKEN в файле .env")
-        # Неполные данные Prodamus — не повод останавливать бота: он работает в режиме витрины,
+        # Неполные данные ЮKassa — не повод останавливать бота: он работает в режиме витрины,
         # а причину пишет в журнал и присылает администратору (см. showcase_reason).
-        if self.pay_url and self.pay_secret and not re.fullmatch(r"https://[a-z0-9.-]+", self.pay_url):
-            raise ConfigError("PRODAMUS_URL — адрес платёжной страницы вида https://имя.payform.ru, "
-                              f"сейчас: «{self.pay_url}»")
-        if self.pay_url and self.pay_secret and not self.public_url:
-            raise ConfigError("Для приёма оплаты нужен PUBLIC_URL — адрес бота с https://, на него Prodamus "
-                              "присылает уведомления об оплате")
+        if self.shop_id and not self.shop_id.isdigit():
+            raise ConfigError(f"YOOKASSA_SHOP_ID — числовой идентификатор магазина, сейчас: «{self.shop_id}»")
+        if self.secret_key and not re.fullmatch(r"(live|test)_[A-Za-z0-9_-]{10,}", self.secret_key):
+            raise ConfigError("YOOKASSA_SECRET_KEY — секретный ключ вида live_… (или test_… для тестового магазина)")
+        if self.secret_key.startswith("test_") and not self.test_mode:
+            raise ConfigError("Ключ тестового магазина (test_…) — включите PAYMENTS_TEST_MODE=true, иначе гайд "
+                              "получал бы любой, кто «оплатил» тестовой картой")
+        if not self.api_url.startswith("https://") and not self.api_url.startswith("http://127.0.0.1"):
+            raise ConfigError("YOOKASSA_API_URL должен начинаться с https://")
+        if self.shop_id and self.secret_key and not self.public_url:
+            raise ConfigError("Для приёма оплаты нужен PUBLIC_URL — адрес бота с https://, на него ЮKassa "
+                              "возвращает покупателя и присылает уведомления")
         if not 1 <= self.web_port <= 65535:
             raise ConfigError(f"WEB_PORT должен быть от 1 до 65535, сейчас: {self.web_port}")
         if self.public_url and not self.public_url.startswith("https://"):
@@ -144,6 +154,11 @@ class Config:
         return f"{self.price_rub:.2f}"
 
     @property
+    def return_url(self) -> str:
+        """Куда ЮKassa возвращает покупателя после оплаты (оттуда — обратно в бота)."""
+        return f"{self.public_url}/pay/success" if self.public_url else ""
+
+    @property
     def notify_url(self) -> str:
-        """Адрес для уведомлений об оплате — его вписывают в настройках платёжной страницы Prodamus."""
+        """Адрес для HTTP-уведомлений — его вписывают в кабинете ЮKassa (Интеграция → HTTP-уведомления)."""
         return f"{self.public_url}/pay/notify" if self.public_url else ""
