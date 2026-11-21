@@ -39,7 +39,8 @@ def main_kb(shop: Shop, paid: bool) -> InlineKeyboardMarkup:
     else:
         rows.append([InlineKeyboardButton(text=texts.BTN_BUY.format(price=_price(shop)), callback_data="buy")])
         rows.append([InlineKeyboardButton(text=texts.BTN_ABOUT, callback_data="about")])
-    rows.append([InlineKeyboardButton(text=texts.BTN_SUPPORT, callback_data="support")])
+    rows.append([InlineKeyboardButton(text=texts.BTN_SUPPORT, callback_data="support"),
+                 InlineKeyboardButton(text=texts.BTN_PRIVACY, callback_data="privacy")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -47,11 +48,26 @@ def pay_kb(shop: Shop, url: str, payment_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=texts.BTN_PAY.format(price=_price(shop)), url=url)],
         [InlineKeyboardButton(text=texts.BTN_CHECK, callback_data=f"check:{payment_id}")],
+        [InlineKeyboardButton(text=texts.BTN_PRIVACY, callback_data="privacy")],
     ])
 
 
 def _offer_note(shop: Shop) -> str:
-    return texts.OFFER_NOTE.format(url=html.escape(shop.cfg.offer_url, quote=True)) if shop.cfg.offer_url else ""
+    if shop.cfg.offer_url:
+        return texts.OFFER_NOTE.format(url=html.escape(shop.cfg.offer_url, quote=True))
+    return texts.PRIVACY_NOTE
+
+
+def privacy_text(shop: Shop) -> str:
+    cfg = shop.cfg
+    contacts = []
+    if cfg.support_username:
+        contacts.append(f"@{html.escape(cfg.support_username)} в Telegram")
+    if cfg.seller_email:
+        contacts.append(html.escape(cfg.seller_email))
+    return texts.PRIVACY.format(
+        seller=html.escape(cfg.seller_name or "продавец"), inn=html.escape(cfg.seller_inn or "—"),
+        contacts=" · ".join(contacts) or "через раздел «Поддержка» в боте", date=texts.PRIVACY_DATE)
 
 
 async def _send(bot: Bot, user_id: int, text: str, **kw) -> None:
@@ -232,6 +248,28 @@ async def about(call: CallbackQuery, shop: Shop, bot: Bot):
 async def support(call: CallbackQuery, shop: Shop, bot: Bot):
     await call.answer()
     await _send(bot, call.from_user.id, _support_text(shop, call.from_user.id))
+
+
+@router.callback_query(F.data == "privacy")
+async def privacy(call: CallbackQuery, shop: Shop, bot: Bot):
+    await call.answer()
+    await _send(bot, call.from_user.id, privacy_text(shop), reply_markup=back_kb())
+
+
+@router.message(Command("privacy"))
+async def privacy_cmd(message: Message, shop: Shop):
+    await message.answer(privacy_text(shop), reply_markup=back_kb(), disable_web_page_preview=True)
+
+
+@router.callback_query(F.data == "menu")
+async def menu(call: CallbackQuery, shop: Shop, bot: Bot):
+    await call.answer()
+    paid = await shop.db.has_paid(call.from_user.id)
+    await _send(bot, call.from_user.id, texts.FALLBACK, reply_markup=main_kb(shop, paid))
+
+
+def back_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=texts.BTN_BACK, callback_data="menu")]])
 
 
 @router.message(Command("help", "support"))

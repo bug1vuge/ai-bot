@@ -29,6 +29,7 @@ COMMANDS = [
     BotCommand(command="start", description="Главное меню"),
     BotCommand(command="my", description="Мои покупки"),
     BotCommand(command="help", description="Поддержка"),
+    BotCommand(command="privacy", description="Политика конфиденциальности"),
 ]
 
 

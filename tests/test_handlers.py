@@ -98,6 +98,7 @@ async def test_full_purchase_flow(env):
     button_url = pay_msg.reply_markup.inline_keyboard[0][0].url
     pid = pay_msg.reply_markup.inline_keyboard[1][0].callback_data.split(":")[1]
     assert button_url == shop.yk.by_order(pid)["confirmation"]["confirmation_url"]
+    assert pay_msg.reply_markup.inline_keyboard[2][0].callback_data == "privacy"
 
     await dp.feed_update(bot, cb_update(3, f"check:{pid}"))
     assert "пока не поступила" in texts_of(session)[-1]
@@ -397,3 +398,50 @@ async def test_check_foreign_order_is_hidden(env):
     await dp.feed_update(bot, cb_update(530, f"check:{pid}"))     # чужой заказ
     assert "Не нашёл ваших платежей" in texts_of(session)[-1]
 
+
+# ---------- политика конфиденциальности ----------
+async def test_privacy_button_and_command(env):
+    import html.parser
+
+    dp, bot, shop, session = env
+    shop.cfg.seller_name, shop.cfg.seller_inn, shop.cfg.seller_email = "Малютин Максим", "701760448883", "a@b.ru"
+    await dp.feed_update(bot, msg_update(600, "/start"))
+    kb = [c for c in session.calls if isinstance(c, SendMessage)][-1].reply_markup.inline_keyboard
+    assert any(b.callback_data == "privacy" for row in kb for b in row)
+    await dp.feed_update(bot, cb_update(601, "privacy"))
+    msg = [c for c in session.calls if isinstance(c, SendMessage)][-1]
+    for part in ("Политика конфиденциальности", "Малютин Максим", "701760448883", "@help_me", "a@b.ru",
+                 "ЮKassa", "152-ФЗ"):
+        assert part in msg.text, part
+    assert msg.reply_markup.inline_keyboard[0][0].callback_data == "menu"
+
+    class Visible(html.parser.HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.text, self.stack = "", []
+
+        def handle_starttag(self, tag, attrs):
+            assert tag in {"b", "i", "blockquote", "a", "code"}, tag
+            self.stack.append(tag)
+
+        def handle_endtag(self, tag):
+            assert self.stack and self.stack.pop() == tag, f"незакрытый тег {tag}"
+
+        def handle_data(self, data):
+            self.text += data
+    v = Visible()
+    v.feed(msg.text)
+    assert not v.stack and len(v.text) <= 4096               # лимит сообщения Telegram
+    await dp.feed_update(bot, msg_update(602, "/privacy"))
+    assert "Политика конфиденциальности" in texts_of(session)[-1]
+    await dp.feed_update(bot, cb_update(603, "menu"))
+    assert texts_of(session)[-1] == "Выберите действие 👇"
+
+
+async def test_privacy_escapes_seller_fields(env):
+    dp, bot, shop, session = env
+    shop.cfg.seller_name, shop.cfg.seller_inn, shop.cfg.support_username = "<b>x", "1&2", ""
+    shop.cfg.seller_email = ""
+    await dp.feed_update(bot, msg_update(610, "/privacy"))
+    t = texts_of(session)[-1]
+    assert "&lt;b&gt;x" in t and "1&amp;2" in t and "раздел «Поддержка»" in t

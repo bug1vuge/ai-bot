@@ -622,7 +622,7 @@ async def test_offer_page(shop):
     shop.cfg.seller_name, shop.cfg.seller_inn = "Малютин Максим", "701760448883"
     shop.cfg.seller_email, shop.cfg.support_username = "ivan@example.com", "help_me"
     page = render_offer(shop.cfg, "guide_bot")
-    for part in ("Малютин Максим", "ИНН 701760448883", "@guide_bot", "990 рублей", "ЮKassa"):
+    for part in ("Малютин Максим", "ИНН 701760448883", "@guide_bot", "990 рублей", "ЮKassa", "/privacy"):
         assert part in page, part
     assert "Prodamus" not in page and missing_fields(shop.cfg) == []
     async with TestClient(TestServer(make_app(shop))) as client:

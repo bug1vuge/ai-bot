@@ -141,6 +141,9 @@ async def test_purchase_end_to_end(app):
     await wait_for(lambda: tg.sent("setMyShortDescription"))
     assert "ИНН 701760448883" in tg.sent("setMyShortDescription")[0]["short_description"]
     assert "Малютин Максим" in tg.sent("setMyDescription")[0]["description"]
+    commands = tg.sent("setMyCommands")[0]["commands"]
+    commands = json.loads(commands) if isinstance(commands, str) else commands
+    assert any(c["command"] == "privacy" for c in commands)
     assert any("/pay/notify" in d["text"] for d in tg.sent("sendMessage") if str(d["chat_id"]) == "999")
     order = await buy(tg)
     assert yk.by_order(order)["amount"] == {"value": "990.00", "currency": "RUB"}
