@@ -32,6 +32,18 @@ for f in requirements.txt bot/main.py data/offer.md .env.example; do
 done
 # сам гайд в git не хранится: его кладут в data/ отдельно (или он уже есть с прошлой установки)
 if [[ ! -f "$SRC_DIR/data/guide.pdf" && ! -f "$APP_DIR/data/guide.pdf" ]]; then
+  # загрузили PDF под своим именем — если он в data/ один, просто переименовываем
+  shopt -s nullglob
+  pdfs=("$SRC_DIR"/data/*.pdf)
+  shopt -u nullglob
+  if [[ ${#pdfs[@]} -eq 1 ]]; then
+    echo "Беру гайд: ${pdfs[0]}"
+    mv "${pdfs[0]}" "$SRC_DIR/data/guide.pdf"
+  elif [[ ${#pdfs[@]} -gt 1 ]]; then
+    die "В $SRC_DIR/data несколько PDF-файлов. Оставьте один (гайд) или переименуйте его в guide.pdf."
+  fi
+fi
+if [[ ! -f "$SRC_DIR/data/guide.pdf" && ! -f "$APP_DIR/data/guide.pdf" ]]; then
   die "Нет файла гайда data/guide.pdf. Загрузите PDF в $SRC_DIR/data/guide.pdf (через FileZilla или scp) и запустите скрипт снова."
 fi
 
@@ -40,6 +52,20 @@ say "Устанавливаю системные пакеты"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y python3 python3-venv curl ca-certificates fonts-dejavu-core
+
+# На самых дешёвых серверах (1 ГБ памяти) без файла подкачки установка библиотек и сборка
+# PDF с водяным знаком могут упасть по нехватке памяти — добавляем 1 ГБ подкачки
+mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+if [[ "$mem_kb" -lt 1600000 ]] && [[ -z "$(swapon --show --noheadings 2>/dev/null)" ]] && [[ ! -e /swapfile ]]; then
+  say "Памяти меньше 1,5 ГБ — добавляю файл подкачки 1 ГБ"
+  if { fallocate -l 1G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none; } \
+      && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile; then
+    grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  else
+    rm -f /swapfile
+    warn "Не удалось включить подкачку (так бывает на некоторых VPS) — продолжаю без неё."
+  fi
+fi
 
 # ---------------------------------------------------------------- кто занимает порты 80/443
 WEB_MODE=caddy
@@ -301,8 +327,12 @@ for _ in 1 2 3 4 5 6; do
   if curl -fs --max-time 10 "$PUBLIC_URL/health" >/dev/null; then HTTPS_OK=1; break; fi
   sleep 5
 done
-[[ "${HTTPS_OK:-}" == 1 ]] && echo "HTTPS работает: $PUBLIC_URL/health" \
-  || warn "HTTPS пока не отвечает. Сертификат может выпускаться ещё минуту-две. Проверьте: curl $PUBLIC_URL/health"
+if [[ "${HTTPS_OK:-}" == 1 ]]; then
+  echo "HTTPS работает: $PUBLIC_URL/health"
+else
+  warn "HTTPS пока не отвечает. Сертификат может выпускаться ещё минуту-две. Проверьте: curl $PUBLIC_URL/health"
+  warn "Если указан свой домен — проверьте, что его A-запись уже указывает на IP этого сервера."
+fi
 
 cat <<DONE
 

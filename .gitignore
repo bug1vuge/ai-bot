@@ -2,6 +2,7 @@
 .env
 data/bot.db
 data/bot.db-*
+data/backups/
 
 # paid product and offline wheels are distributed separately, never via git
 data/guide.pdf
