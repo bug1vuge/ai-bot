@@ -25,6 +25,7 @@ class FakeYooKassa:
         self.test_payments = False
         self.created = 0
         self.refunds = 0
+        self.account: dict = {}   # поля ответа GET /me поверх стандартных
 
     # ---------- управление ----------
     def fail_next(self, prefix: str, what: object, times: int = 1) -> None:
@@ -96,6 +97,9 @@ class FakeYooKassa:
             self.idempotent[key] = (json.dumps(body, sort_keys=True), result)
             return web.json_response(result)
 
+        if method == "GET" and path == "/me":
+            return web.json_response({"account_id": self.shop_id, "test": self.test_payments, "status": "enabled",
+                                      "fiscalization_enabled": False, **self.account})
         if method == "GET" and path.startswith("/payments/"):
             p = self.payments.get(path.split("/")[2])
             if p is None:

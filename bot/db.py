@@ -43,7 +43,8 @@ CREATE TABLE IF NOT EXISTS payments (
     provider_id       TEXT,
     refund_state      TEXT,
     refund_attempts   INTEGER NOT NULL DEFAULT 0,
-    note              TEXT
+    note              TEXT,
+    greeted           INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS counters (
     name  TEXT PRIMARY KEY,
@@ -69,6 +70,7 @@ MIGRATIONS = {
         "refund_state": "TEXT",
         "refund_attempts": "INTEGER NOT NULL DEFAULT 0",
         "note": "TEXT",
+        "greeted": "INTEGER NOT NULL DEFAULT 0",
     },
     "users": {
         "file_id": "TEXT",
@@ -351,6 +353,10 @@ class Database:
             (SENDING, payment_id, NOT_DELIVERED),
         )
         return rows == 1
+
+    async def mark_greeted(self, payment_id: str) -> None:
+        """Покупатель получил сообщение «Оплата прошла» — повторные попытки выдачи его не дублируют."""
+        await self._write("UPDATE payments SET greeted=1 WHERE payment_id=?", (payment_id,))
 
     async def finish_delivery(self, payment_id: str) -> None:
         await self._write("UPDATE payments SET delivered=?, next_attempt_at=NULL WHERE payment_id=?",

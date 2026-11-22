@@ -50,6 +50,8 @@ POLL_CONCURRENCY = 4
 # с тем же ключом не позже чем через 23 часа, иначе заказ закрывается и создаётся новый
 IDEMPOTENCE_SAFE_HOURS = 23
 MAX_REFUND_ATTEMPTS = 20
+# Тревога администратору об отказах ЮKassa в создании платежа — не чаще раза в час
+CREATE_ALERT_EVERY_SEC = 3600
 # Резервные копии базы
 BACKUP_KEEP = 14
 
@@ -96,6 +98,7 @@ class Shop:
         self._locks: dict[str, list] = {}
         self._tasks: set[asyncio.Task] = set()
         self._last_backup: str | None = None
+        self._last_create_alert: float | None = None
 
     @contextlib.asynccontextmanager
     async def _lock(self, key: str):
@@ -141,11 +144,21 @@ class Shop:
 
     async def _create_remote(self, order) -> str:
         """Создаёт платёж в ЮKassa для заказа. Ключ идемпотентности = номер заказа, поэтому повтор
-        после обрыва связи вернёт тот же платёж, а не создаст второй."""
-        payment = await self.pay.create_payment(
-            order_id=order["payment_id"], user_id=order["user_id"], amount=order["amount"],
-            description=f"{self.cfg.payment_description} (заказ {order['payment_id']})",
-            return_url=self.cfg.return_url, idempotence_key=order["payment_id"])
+        после обрыва связи вернёт тот же платёж, а не создаст второй.
+
+        Если ЮKassa отказала по существу (неверные ключи, запрос не принят, конфликт ключа
+        идемпотентности после смены настроек), заказ закрывается: повтор с тем же ключом не поможет,
+        следующее нажатие «Купить» создаст новый заказ. Администратор получает тревогу."""
+        try:
+            payment = await self.pay.create_payment(
+                order_id=order["payment_id"], user_id=order["user_id"], amount=order["amount"],
+                description=f"{self.cfg.payment_description} (заказ {order['payment_id']})",
+                return_url=self.cfg.return_url, idempotence_key=order["payment_id"])
+        except YooKassaError as e:
+            if not e.temporary:
+                await self.db.set_status(order["payment_id"], CANCELED, note=f"ЮKassa отказала: {e}"[:200])
+                await self._alert_create_error(e)
+            raise
         if not payment.confirmation_url:
             raise YooKassaError("ЮKassa не вернула ссылку на оплату")
         await self.db.set_provider(order["payment_id"], payment.id, payment.confirmation_url)
@@ -161,7 +174,12 @@ class Shop:
             # платёж в ЮKassa не создался (сбой связи) — повторяем с тем же ключом идемпотентности
             if age < timedelta(hours=IDEMPOTENCE_SAFE_HOURS) and _same_amount(order["amount"], self.cfg.price_str) \
                     and bool(order["is_test"]) == self.cfg.test_mode:
-                return await self._create_remote(order)
+                try:
+                    return await self._create_remote(order)
+                except YooKassaError as e:
+                    if e.temporary:
+                        raise
+                    return None  # заказ закрыт в _create_remote — создаём новый
             await self.db.set_status(pid, CANCELED, note="платёж не создан")
             return None
         try:
@@ -182,6 +200,39 @@ class Shop:
         if remote.status == YK_PENDING and outcome == "pending":
             return remote.confirmation_url or order["confirmation_url"]
         return None  # отменён, на проверке или возвращён — создаём новый заказ
+
+    async def _alert_create_error(self, error: YooKassaError) -> None:
+        """ЮKassa не принимает запросы магазина — без этого продажи молча остановились бы."""
+        now = asyncio.get_running_loop().time()
+        if self._last_create_alert is not None and now - self._last_create_alert < CREATE_ALERT_EVERY_SEC:
+            return
+        self._last_create_alert = now
+        log.error("ЮKassa отказала в создании платежа: %s", error)
+        await self._notify_admins(texts.ADMIN_CREATE_FAILED.format(error=html.escape(str(error)[:300])))
+
+    async def check_account(self) -> str | None:
+        """Проверка ключей при запуске: запрос «информация о магазине». Возвращает текст проблемы или None."""
+        try:
+            me = await self.pay.me()
+        except YooKassaError as e:
+            if e.status in (401, 403):
+                return "ЮKassa не принимает shopId и секретный ключ из .env — проверьте их (Интеграция → Ключи API)"
+            if e.temporary:
+                log.warning("Не удалось проверить магазин ЮKassa при запуске: %s", e)
+                return None
+            return f"ЮKassa ответила ошибкой при проверке магазина: {e}"
+        problems = []
+        account = str(me.get("account_id") or "")
+        if account and account != self.cfg.shop_id:
+            problems.append(f"ключ принадлежит магазину {account}, а в .env указан {self.cfg.shop_id}")
+        if me.get("status") not in (None, "enabled"):
+            problems.append(f"магазин в статусе «{me.get('status')}» — платежи могут не проходить")
+        if me.get("test") is True and not self.cfg.test_mode:
+            problems.append("это тестовый магазин — включите PAYMENTS_TEST_MODE=true или возьмите боевые ключи")
+        if me.get("fiscalization_enabled") is True:
+            problems.append("в магазине включена отправка чеков (54-ФЗ) — ЮKassa будет требовать данные чека "
+                            "и отклонять платежи; самозанятому её нужно выключить в кабинете")
+        return "; ".join(problems) or None
 
     # ---------- проверка платежа (единая точка для всех путей) ----------
     def _verify(self, order, remote: Payment) -> str | None:
@@ -210,7 +261,7 @@ class Shop:
             await self.db.mark_checked(pid)
             # магазин настроен на двухстадийные платежи — подтверждаем, только если всё сходится;
             # иначе деньги остаются заблокированными и ЮKassa сама вернёт их через несколько дней
-            if remote.status == YK_WAITING and order["status"] == PENDING:
+            if remote.status == YK_WAITING and order["status"] in (PENDING, CANCELED):
                 reason = self._verify(order, remote)
                 if reason:
                     return await self._to_review(order, remote, reason + " (платёж не подтверждён)")
@@ -294,7 +345,9 @@ class Shop:
             order = await self.db.get_payment(payment_id)
             if order is None:
                 return "unknown"
-            if order["status"] != PENDING or not order["provider_id"]:
+            # закрытый у нас заказ (истёк срок) тоже перепроверяем: покупатель мог оплатить в последний
+            # момент, а уведомление — потеряться
+            if order["status"] not in (PENDING, CANCELED) or not order["provider_id"]:
                 return order["status"]
             remote = await self.pay.get_payment(order["provider_id"])
             return await self.apply_payment(order, remote)
@@ -340,7 +393,7 @@ class Shop:
         row = await self.db.get_payment(payment_id)
         if row is None:
             return "unknown"
-        if row["status"] == PENDING and row["provider_id"] and self.cfg.payments_enabled:
+        if row["status"] in (PENDING, CANCELED) and row["provider_id"] and self.cfg.payments_enabled:
             await self.sync_order(payment_id)
             await self.wait_background(timeout=10)
             row = await self.db.get_payment(payment_id)
@@ -435,9 +488,10 @@ class Shop:
         row = await self.db.get_payment(payment_id)
         user_id = row["user_id"]
         try:
-            if not row["manual"] and row["delivery_attempts"] == 0:
+            if not row["manual"] and not row["greeted"]:
                 repeat = await self.db.count_delivered(user_id, exclude=payment_id)
                 await self.bot.send_message(user_id, texts.REPEAT_PAYMENT if repeat else texts.THANKS)
+                await self.db.mark_greeted(payment_id)
                 if repeat:
                     await self._notify_admins(texts.ADMIN_REPEAT_PAYMENT.format(
                         user_id=user_id, payment_id=payment_id, amount=row["amount"]))
@@ -533,7 +587,9 @@ class Shop:
         await self._notify_admins(texts.ADMIN_SALE.format(
             amount=row["amount"], who=html.escape(self._who(user, row["user_id"])), user_id=row["user_id"],
             source=html.escape((user["source"] if user else None) or "—"), payment_id=row["payment_id"],
-            mode=" (тестовый платёж)" if row["is_test"] else ""))
+            mode=" (тестовый платёж)" if row["is_test"] else "",
+            receipt="" if row["is_test"] else texts.ADMIN_RECEIPT_REMINDER.format(
+                amount=row["amount"], title=html.escape(self.cfg.payment_description))))
 
     async def _notify_admins(self, text: str) -> None:
         for admin in self.cfg.admin_ids:

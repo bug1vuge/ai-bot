@@ -171,6 +171,10 @@ class YooKassa:
         }
         return Payment.parse(await self._request("POST", "/payments", json=body, idempotence_key=idempotence_key))
 
+    async def me(self) -> dict:
+        """Информация о магазине (проверка ключей): account_id, test, status, fiscalization_enabled."""
+        return await self._request("GET", "/me")
+
     async def get_payment(self, payment_id: str) -> Payment:
         if not OBJECT_ID_RE.match(payment_id):
             raise YooKassaError(f"некорректный ID платежа: {payment_id!r}", 400, "invalid_id")

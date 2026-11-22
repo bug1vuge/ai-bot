@@ -1,6 +1,7 @@
 """Точка входа: python -m bot.main (или python -m bot)."""
 import asyncio
 import contextlib
+import html
 import logging
 import os
 
@@ -134,6 +135,10 @@ async def run(cfg: Config, session: BaseSession | None = None) -> None:
             log.info("ЮKassa: магазин %s, режим %s", cfg.shop_id, mode)
             await shop._notify_admins(texts.ADMIN_STARTED.format(mode=mode, shop_id=cfg.shop_id, notify_url=cfg.notify_url)
                                       + (texts.TEST_MODE_WARNING if cfg.test_mode else ""))
+            problem = await shop.check_account()
+            if problem:
+                log.error("Магазин ЮKassa: %s", problem)
+                await shop._notify_admins(texts.ADMIN_ACCOUNT_PROBLEM.format(problem=html.escape(problem)))
         else:
             log.warning("Режим витрины (%s): бот всё показывает, но оплату пока не принимает.", cfg.showcase_reason)
             await shop._notify_admins(texts.ADMIN_STARTED_SHOWCASE.format(reason=cfg.showcase_reason))

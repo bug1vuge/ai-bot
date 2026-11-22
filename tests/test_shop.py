@@ -308,6 +308,58 @@ async def test_late_payment_on_old_order_is_found(shop, yk):
     assert len(shop.bot.documents) == 1
 
 
+async def test_check_button_finds_payment_on_expired_order(shop, yk):
+    """Заказ закрыт у нас по сроку, покупатель оплатил в последний момент, уведомление потерялось."""
+    order, _ = await shop.get_or_create_payment(USER)
+    await shop.db.set_status(order, dbmod.CANCELED, note="истёк срок")
+    yk.pay(yk.by_order(order)["id"])
+    assert await shop.process_payment(order) in {"succeeded", "already_delivered"}
+    assert len(shop.bot.documents) == 1
+    assert (await shop.db.get_payment(order))["status"] == "succeeded"
+
+
+async def test_changed_settings_after_lost_response_do_not_block_buying(shop, yk):
+    """ЮKassa создала платёж, ответ потерялся, затем поменялись настройки (описание, адрес возврата):
+    повтор с тем же ключом ЮKassa отклоняет — заказ закрывается, покупатель сразу получает новую ссылку."""
+    yk.fail_next("POST /payments", "slow", times=4)
+    with pytest.raises(YooKassaError):
+        await shop.get_or_create_payment(USER)
+    shop.cfg.payment_description = "Новое описание"
+    order, url = await shop.get_or_create_payment(USER)   # конфликт ключа: старый заказ закрыт, создан новый
+    assert url and (await shop.db.get_payment(order))["provider_id"]
+    assert len([t for t in admin_texts(shop) if "отказывается создавать" in t]) == 1
+
+
+async def test_rejected_payment_creation_alerts_admin_once(shop, yk):
+    yk.secret = "live_" + "X" * 40   # ключ отозван в кабинете
+    for _ in range(3):
+        with pytest.raises(YooKassaError):
+            await shop.get_or_create_payment(USER)
+    assert len([t for t in admin_texts(shop) if "отказывается создавать" in t]) == 1
+    assert await shop.db.open_order(USER) is None   # мёртвые заказы не висят
+    yk.secret = SECRET
+    _, url = await shop.get_or_create_payment(USER)
+    assert url
+
+
+@pytest.mark.parametrize("account, problem", [
+    ({}, None),
+    ({"account_id": "999999"}, "принадлежит магазину 999999"),
+    ({"test": True}, "тестовый магазин"),
+    ({"fiscalization_enabled": True}, "отправка чеков"),
+    ({"status": "disabled"}, "в статусе"),
+])
+async def test_check_account(shop, yk, account, problem):
+    yk.account = account
+    result = await shop.check_account()
+    assert result is None if problem is None else problem in result
+
+
+async def test_check_account_with_wrong_key(shop, yk):
+    yk.secret = "live_" + "X" * 40
+    assert "не принимает" in await shop.check_account()
+
+
 async def test_check_button_asks_yookassa(shop, yk):
     order, _ = await shop.get_or_create_payment(USER)
     assert await shop.process_payment(order) == "pending"
@@ -433,6 +485,27 @@ async def test_delivery_gives_up_and_returning_user_still_gets_guide(shop, yk, m
     assert shop.bot.documents == []
     assert await shop.deliver_pending_for_user(USER)
     assert len(shop.bot.documents) == 1
+
+
+async def test_returning_user_gets_single_thanks(shop, yk):
+    shop.bot.fail_documents = 1
+    await buy_and_pay(shop, yk)
+    assert await shop.deliver_pending_for_user(USER)
+    assert len(shop.bot.documents) == 1
+    assert len([t for t in user_texts(shop) if "Оплата прошла" in t]) == 1
+
+
+async def test_sale_notification_reminds_about_receipt(shop, yk):
+    await buy_and_pay(shop, yk)
+    sale = next(t for t in admin_texts(shop) if "Новая продажа" in t)
+    assert "Мой налог" in sale and "990.00" in sale
+
+
+async def test_test_sale_has_no_receipt_reminder(shop, yk):
+    shop.cfg.test_mode = yk.test_payments = True
+    await buy_and_pay(shop, yk)
+    sale = next(t for t in admin_texts(shop) if "Новая продажа" in t)
+    assert "Мой налог" not in sale
 
 
 async def test_restart_during_sending_is_redelivered(shop, yk):

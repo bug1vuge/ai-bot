@@ -112,7 +112,11 @@ BTN_BACK = "⬅️ В меню"
 # Уведомления администратору
 ADMIN_SALE = (
     "💰 Новая продажа{mode}: {amount} ₽\nПокупатель: {who} (ID <code>{user_id}</code>)\n"
-    "Источник: {source}\nЗаказ: <code>{payment_id}</code>"
+    "Источник: {source}\nЗаказ: <code>{payment_id}</code>{receipt}"
+)
+# ЮKassa с 29.12.2025 не передаёт доходы самозанятых в ФНС — чек пробивается вручную
+ADMIN_RECEIPT_REMINDER = (
+    "\n\n🧾 Пробейте чек в «Мой налог»: {amount} ₽, «{title}», покупатель — физлицо."
 )
 ADMIN_DELIVERY_FAIL = (
     "⚠️ Не удалось выдать гайд пользователю <code>{user_id}</code> (заказ <code>{payment_id}</code>), "
@@ -142,8 +146,14 @@ ADMIN_PAYMENT_REVIEW = (
 )
 ADMIN_REFUNDED = (
     "↩️ По заказу <code>{payment_id}</code> (пользователь <code>{user_id}</code>) возвращено {amount} ₽. "
-    "Заказ больше не считается продажей."
+    "Заказ больше не считается продажей. Если чек в «Мой налог» уже пробит — аннулируйте его "
+    "(причина «Возврат средств»)."
 )
+ADMIN_CREATE_FAILED = (
+    "🚨 ЮKassa отказывается создавать платежи — покупатели не могут оплатить: {error}\n"
+    "Проверьте shopId и секретный ключ в .env и статус магазина в кабинете ЮKassa."
+)
+ADMIN_ACCOUNT_PROBLEM = "🚨 Проблема с магазином ЮKassa: {problem}"
 ADMIN_FOREIGN_NOTIFICATION = (
     "⚠️ На адрес уведомлений об оплате пришёл запрос не от ЮKassa (адрес {ip}) — он отклонён. "
     "Ничего делать не нужно: бот проверяет каждую оплату через API ЮKassa."
